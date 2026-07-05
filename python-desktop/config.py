@@ -106,6 +106,17 @@ class Settings(BaseSettings):
 
     keep_alive: bool = Field(default=True, alias="KEEP_ALIVE")
 
+    # Muscle Memory: local grounding learned from verified Gemini groundings.
+    # enabled -> adds the tier-1.5 recall path; threshold is the conservative
+    # cosine-similarity floor below which a stored reflex is NOT trusted and the
+    # turn falls through to Gemini (see muscle/ and the risk-check skill).
+    muscle_enabled: bool = Field(default=True, alias="MUSCLE_ENABLED")
+    muscle_threshold: float = Field(default=0.92, alias="MUSCLE_THRESHOLD")
+    # Per-site reflex ceiling: past it the weakest (lowest success-count, then
+    # oldest) reflexes are evicted, keeping the store bounded and self-healing
+    # without any decay job. <= 0 disables eviction.
+    muscle_site_cap: int = Field(default=20, alias="MUSCLE_SITE_CAP")
+
     max_turns: int = Field(default=120, alias="MAX_TURNS")
     max_idle_turns: int = Field(default=1500, alias="MAX_IDLE_TURNS")
     loop_idle_sleep_s: float = Field(default=0.4, alias="LOOP_IDLE_SLEEP_S")

@@ -28,6 +28,7 @@ from config import DEFAULT_GOAL, Settings, is_placeholder_key, load_settings
 from hud import Hud
 from mac_control import MacController, check_macos_permissions, denormalize_box
 from memory import MemoryStore
+from muscle import MuscleMemory, MuscleStore, build_muscle_ground_fn, build_muscle_verify_fn
 from router import IntentRouter, is_correction
 from state import Step, TaskState
 from tts import Speaker
@@ -112,13 +113,21 @@ def build_observe_fn(stt_queue: "queue.Queue[str]", mac: MacController, task: Ta
     return _observe
 
 
-def build_ground_fn(vision: GeminiVision, mac: MacController, router: IntentRouter) -> GroundFn:
+def build_ground_fn(
+    vision: GeminiVision,
+    mac: MacController,
+    router: IntentRouter,
+    muscle: MuscleMemory | None = None,
+) -> GroundFn:
     """Builds the DECIDE->target callable: router fast-path, else Gemini box.
 
-    Two-tier DECIDE: first the zero-LLM `IntentRouter` fast-paths (a step
+    Three-tier DECIDE: first the zero-LLM `IntentRouter` fast-paths (a step
     like "open Slack" becomes an `open_app`/`open_url` action with no Gemini
-    call at all); only steps that do not match a fast path fall through to
-    vision grounding, where Gemini returns a normalized box.
+    call at all); then, when a `muscle` memory is wired, a local recall tier
+    (1.5) replays a past *verified* Gemini grounding for a matching screen with
+    no cloud call; only a miss falls through to vision grounding, where Gemini
+    returns a normalized box (and that grounding is staged for muscle to learn
+    once the step verifies done).
 
     NOTE(tom): `mac.capture_screenshot_logical()` already resizes the
     screenshot to the logical (pyautogui) resolution before it reaches
@@ -135,10 +144,7 @@ def build_ground_fn(vision: GeminiVision, mac: MacController, router: IntentRout
         A callable suitable for `AgentLoop(ground_fn=...)`.
     """
 
-    def _ground(task: TaskState, step: Step, observation: Observation) -> ActionPlan | None:
-        routed = router.route(step.desc)
-        if routed is not None:
-            return ActionPlan(kind=routed.kind, step_id=step.id, text=routed.target)
+    def _gemini_ground(task: TaskState, step: Step, observation: Observation) -> ActionPlan | None:
         if observation.screenshot is None:
             return None
         try:
@@ -161,7 +167,40 @@ def build_ground_fn(vision: GeminiVision, mac: MacController, router: IntentRout
             return ActionPlan(kind="scroll", step_id=step.id, target=grounded.amount)
         return None
 
+    # Tier 1.5: wrap the Gemini grounding with the local recall/stage tier when
+    # muscle memory is enabled. Router (tier 1) stays in front and is never
+    # memorized -- it is already zero-LLM.
+    decide = _gemini_ground
+    if muscle is not None:
+        decide = build_muscle_ground_fn(_gemini_ground, muscle, _site_key, _params_key)
+
+    def _ground(task: TaskState, step: Step, observation: Observation) -> ActionPlan | None:
+        routed = router.route(step.desc)
+        if routed is not None:
+            return ActionPlan(kind=routed.kind, step_id=step.id, text=routed.target)
+        return decide(task, step, observation)
+
     return _ground
+
+
+def _site_key(task: TaskState, observation: Observation) -> str:
+    """Returns the per-site scope key a reflex is stored/recalled under.
+
+    PoC: a single "default" scope, so a repeat of the same task recalls its own
+    reflexes. TODO(live): key by the frontmost app / active URL so reflexes are
+    scoped per website (a "Send" button on one app never matches another).
+    """
+    return "default"
+
+
+def _params_key(task: TaskState, observation: Observation) -> dict[str, str]:
+    """Returns the dynamic goal params used to template the cache key/action.
+
+    PoC: no params, so cache keys are the plain normalized step text. TODO(live):
+    extract slots from the goal (e.g. the query in "search for {query}") so one
+    reflex serves every value of a dynamic argument (see muscle/templating.py).
+    """
+    return {}
 
 
 def build_plan_fn(vision: GeminiVision) -> PlanFn:
@@ -186,11 +225,13 @@ def build_plan_fn(vision: GeminiVision) -> PlanFn:
     return _plan
 
 
-def build_verify_fn(vision: GeminiVision) -> VerifyFn:
+def build_verify_fn(vision: GeminiVision, muscle: MuscleMemory | None = None) -> VerifyFn:
     """Builds the step-completion judge, degrading failures to "not done".
 
     Args:
         vision: The Gemini client (its `verify_step_done` does the judging).
+        muscle: When wired, a verified step commits its staged Gemini grounding
+            into a reflex -- verification is the oracle that gates writes.
 
     Returns:
         A callable suitable for `AgentLoop(verify_fn=...)`. On a failed
@@ -204,6 +245,8 @@ def build_verify_fn(vision: GeminiVision) -> VerifyFn:
             logger.warning("verification failed for step %s: %s", step.id, error)
             return False
 
+    if muscle is not None:
+        return build_muscle_verify_fn(_verify, muscle)
     return _verify
 
 
@@ -361,6 +404,25 @@ def main(argv: list[str] | None = None) -> int:
     router = IntentRouter()  # DECIDE tier 1: zero-LLM fast-paths, wired into build_ground_fn
     speaker = Speaker()
 
+    # DECIDE tier 1.5: Muscle Memory (local grounding learned from verified
+    # Gemini groundings). Disabled cleanly if no local encoder is installed --
+    # the agent just runs Gemini-only, never crashes.
+    muscle: MuscleMemory | None = None
+    if settings.muscle_enabled:
+        try:
+            from muscle import build_default_embed_fn
+
+            muscle = MuscleMemory(
+                store=MuscleStore(settings.db_path),
+                embed_fn=build_default_embed_fn(),
+                threshold=settings.muscle_threshold,
+                site_cap=settings.muscle_site_cap,
+            )
+            logger.info("Muscle Memory enabled (threshold=%.2f)", settings.muscle_threshold)
+        except Exception as error:  # noqa: BLE001 - optional feature, never fatal
+            logger.warning("Muscle Memory disabled (no local encoder): %s", error)
+            muscle = None
+
     if args.resume:
         task = memory.resume_task_state(args.resume)
         if task is None:
@@ -395,14 +457,14 @@ def main(argv: list[str] | None = None) -> int:
                 task=task,
                 memory=memory,
                 observe_fn=build_observe_fn(stt_queue, mac, task),
-                ground_fn=build_ground_fn(vision, mac, router),
+                ground_fn=build_ground_fn(vision, mac, router, muscle),
                 act_fn=build_act_fn(mac, settings),
                 speak_fn=speaker.say,
                 hud=hud,
                 stop_event=stop_event,
                 max_turns=settings.max_turns,
                 plan_fn=build_plan_fn(vision),
-                verify_fn=build_verify_fn(vision),
+                verify_fn=build_verify_fn(vision, muscle),
                 override_fn=build_override_fn(vision),
                 idle_sleep_s=settings.loop_idle_sleep_s,
                 max_idle_turns=settings.max_idle_turns,
@@ -415,6 +477,14 @@ def main(argv: list[str] | None = None) -> int:
             kill_switch.stop()
 
     logger.info("Run summary: %s", summary)
+    if muscle is not None:
+        stats = muscle.stats()
+        logger.info(
+            "Muscle Memory: %d local hit(s), %d Gemini grounding(s) this run, %d reflex(es) stored",
+            stats["local_hits"],
+            stats["gemini_groundings"],
+            stats["stored"],
+        )
     memory.close()
     return 0
 
