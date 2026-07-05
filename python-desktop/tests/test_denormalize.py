@@ -18,6 +18,22 @@ def test_denormalize_point_corners_are_clamped_on_screen() -> None:
     assert mc.denormalize_point(1000, 1000, width=1440, height=900) == (1438, 898)
 
 
+def test_denormalize_point_cu_range_999_center_and_corners() -> None:
+    # The Interactions Computer Use path returns 0-999 points (norm_max=999):
+    # ~500/999 of the screen is the center, and the ceiling 999 maps to the
+    # far edge, clamped one pixel inside like every other path.
+    assert mc.denormalize_point(500, 500, width=1000, height=2000, norm_max=999) == (501, 1001)
+    assert mc.denormalize_point(999, 999, width=1440, height=900, norm_max=999) == (1438, 898)
+    assert mc.denormalize_point(0, 0, width=1440, height=900, norm_max=999) == (1, 1)
+
+
+def test_denormalize_point_cu_range_asymmetric_pins_x_y_order() -> None:
+    # x-first, y-second (a {x, y} POINT, not a [y, x, ...] box): a swap would
+    # pass every symmetric fixture but transpose real clicks. width != height,
+    # x=999 lands on the wide axis, y=0 on the top edge.
+    assert mc.denormalize_point(999, 0, width=2000, height=1000, norm_max=999) == (1998, 1)
+
+
 def test_denormalize_box_center() -> None:
     # Box covering the whole normalized space -> center of the real screen.
     box = (0, 0, 1000, 1000)

@@ -86,6 +86,11 @@ class TaskState(BaseModel):
         overrides: Operator corrections that recalibrate remaining steps.
         session_count: Incremented every time this task is resumed/reloaded.
         status: Overall task lifecycle (active/paused/done).
+        interactions_session_id: The last Computer Use interaction id (the
+            `previous_interaction_id` continuation handle) when running in
+            CU_MODE=interactions. Persisted so `--resume` can reuse the live
+            session instead of starting a blank one; None in grounding mode
+            or before the first CU call.
     """
 
     task_id: str
@@ -96,6 +101,7 @@ class TaskState(BaseModel):
     overrides: list[Override] = Field(default_factory=list)
     session_count: int = 1
     status: TaskStatus = TaskStatus.ACTIVE
+    interactions_session_id: str | None = None
 
     def mark_step(self, step_id: str, status: StepStatus, note: str | None = None) -> None:
         """Transitions one step to a new status, optionally attaching a note.
@@ -246,6 +252,7 @@ class TaskState(BaseModel):
             "goal": self.goal,
             "status": self.status.value,
             "session_count": self.session_count,
+            "interactions_session_id": self.interactions_session_id,
             "progress": f"{done}/{total}",
             "steps": [
                 {"id": s.id, "desc": s.desc, "status": s.status.value, "note": s.note}

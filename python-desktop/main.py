@@ -27,7 +27,8 @@ from typing import Any
 from agent import ActFn, ActionPlan, AgentLoop, GroundFn, Observation, ObserveFn, OverrideFn, PlanFn
 from config import DEFAULT_GOAL, Settings, is_placeholder_key, load_settings
 from hud import Hud
-from mac_control import MacController, check_macos_permissions, denormalize_box
+from interactions_cu import InteractionsComputerUse
+from mac_control import MacController, check_macos_permissions, denormalize_box, denormalize_point
 from memory import MemoryStore
 from router import IntentRouter, is_correction
 from state import Step, TaskState
@@ -124,25 +125,40 @@ def build_observe_fn(
 
 
 def build_ground_fn(
-    vision: GeminiVision, mac: MacController, router: IntentRouter, tracer: Any = None
+    vision: GeminiVision,
+    mac: MacController,
+    router: IntentRouter,
+    settings: Settings,
+    cu: InteractionsComputerUse | None = None,
+    tracer: Any = None,
 ) -> GroundFn:
-    """Builds the DECIDE->target callable: router fast-path, else Gemini box.
+    """Builds the DECIDE->target callable: router fast-path, else model grounding.
 
     Two-tier DECIDE: first the zero-LLM `IntentRouter` fast-paths (a step
-    like "open Slack" becomes an `open_app`/`open_url` action with no Gemini
+    like "open Slack" becomes an `open_app`/`open_url` action with no model
     call at all); only steps that do not match a fast path fall through to
-    vision grounding, where Gemini returns a normalized box.
+    model grounding. The fast-path tier runs upstream in BOTH grounding
+    routes -- only the fallback differs, selected by `settings.cu_mode`:
+
+      * "grounding" (default): `vision.ground` returns a normalized
+        [ymin,xmin,ymax,xmax] box (`denormalize_box`). Unchanged.
+      * "interactions": the official Computer Use path (`cu.ground` ->
+        `interactions.create`) returns a 0..CU_NORM_MAX {x,y} point
+        (`denormalize_point`).
 
     NOTE(tom): `mac.capture_screenshot_logical()` already resizes the
     screenshot to the logical (pyautogui) resolution before it reaches
-    Gemini, so the Retina SCALE factor is 1.0 here and `denormalize_box`
-    maps straight onto `mac.screen_size_logical()` -- no extra division
-    needed (see mac_control.py docstrings for the alternative path).
+    Gemini, so the Retina SCALE factor is 1.0 here and `denormalize_box`/
+    `denormalize_point` map straight onto `mac.screen_size_logical()` -- no
+    extra division needed (see mac_control.py docstrings).
 
     Args:
-        vision: The Gemini vision-grounding client.
+        vision: The Gemini vision-grounding client (Route 2 fallback).
         mac: Controller used to read the current logical screen size.
         router: Zero-LLM intent router for cheap "open app/URL" steps.
+        settings: Application settings (its `cu_mode` picks the fallback).
+        cu: The Interactions Computer Use client (Route 1); required when
+            `cu_mode == "interactions"`, ignored otherwise.
 
     Returns:
         A callable suitable for `AgentLoop(ground_fn=...)`.
@@ -165,6 +181,8 @@ def build_ground_fn(
             return ActionPlan(kind=routed.kind, step_id=step.id, text=routed.target, completes_step=True)
         if observation.screenshot is None:
             return None
+        if settings.cu_mode == "interactions" and cu is not None:
+            return _ground_via_interactions(task, step, observation.screenshot, cu, mac, settings, trace)
         try:
             grounded = vision.ground(task, step, observation.screenshot)
         except VisionError as error:
@@ -202,6 +220,68 @@ def build_ground_fn(
         return plan
 
     return _ground
+
+
+def _ground_via_interactions(
+    task: TaskState,
+    step: Step,
+    screenshot: Any,
+    cu: InteractionsComputerUse,
+    mac: MacController,
+    settings: Settings,
+    trace: Any,
+) -> ActionPlan | None:
+    """Grounds one step through the Computer Use path, mapping a point to a plan.
+
+    Mirrors the vision branch of `build_ground_fn` but for Route 1: the CU
+    model returns a 0..CU_NORM_MAX {x,y} point (`denormalize_point`) instead
+    of a box, and signals "step already satisfied" by issuing no function
+    call (mapped to `ActionPlan(kind="done")`, exactly like the grounding
+    path's done-or-act). The live session id is copied back onto the task so
+    the agent loop's next save persists it for `--resume`. A None from
+    `cu.ground` (unsupported call, safety refusal, or any failure) stalls.
+
+    Args:
+        task: The current hold-state (its session id is updated here).
+        step: The step being grounded.
+        screenshot: The current logical-resolution screenshot.
+        cu: The Interactions Computer Use client.
+        mac: Controller used to read the logical screen size.
+        settings: Application settings (cu_norm_max for denormalization).
+        trace: The trace sink for HUD/debug events.
+
+    Returns:
+        An `ActionPlan` to execute, `ActionPlan(kind="done")` if the step is
+        satisfied, or None to stall.
+    """
+    action = cu.ground(task, step, screenshot)
+    task.interactions_session_id = cu.session_id  # persisted by the loop's save
+    if action is None:
+        trace.event("LOOP", f"[{step.id}] CU returned no action -> stall")
+        return None
+    trace.event(
+        "THINK", f"[{step.id}] {step.desc} -> CU {action.kind} :: {action.reasoning or ''}"
+    )
+    if action.kind == "done":
+        trace.event("VERIFY", f"[{step.id}] {step.desc} -> already satisfied (CU)")
+        return ActionPlan(kind="done", step_id=step.id)
+    plan: ActionPlan | None = None
+    if action.kind == "click" and action.point is not None:
+        width, height = mac.screen_size_logical()
+        target = denormalize_point(action.point[0], action.point[1], width, height, settings.cu_norm_max)
+        plan = ActionPlan(kind="click", step_id=step.id, target=target, text=action.reasoning)
+    elif action.kind == "type" and action.text:
+        plan = ActionPlan(kind="type", step_id=step.id, text=action.text)
+    elif action.kind == "hotkey" and action.keys:
+        plan = ActionPlan(kind="hotkey", step_id=step.id, target=tuple(action.keys))
+    elif action.kind == "scroll" and action.amount is not None:
+        plan = ActionPlan(kind="scroll", step_id=step.id, target=action.amount)
+    if plan is not None:
+        detail = plan.target if plan.kind != "type" else plan.text
+        trace.event("ACTION", f"[{step.id}] {plan.kind}: {detail}")
+    else:
+        trace.event("LOOP", f"[{step.id}] CU returned {action.kind} -> no actionable plan")
+    return plan
 
 
 def build_plan_fn(vision: GeminiVision, tracer: Any = None) -> PlanFn:
@@ -446,6 +526,9 @@ def main(argv: list[str] | None = None) -> int:
     memory = MemoryStore(settings.db_path)
     mac = MacController(pyautogui_pause_s=settings.pyautogui_pause_s)
     vision = GeminiVision(settings)
+    # Route 1 (official Computer Use) is only built when selected; in the
+    # default grounding mode it stays None and build_ground_fn never touches it.
+    cu = InteractionsComputerUse(settings) if settings.cu_mode == "interactions" else None
     router = IntentRouter()  # DECIDE tier 1: zero-LLM fast-paths, wired into build_ground_fn
     speaker = Speaker()
 
@@ -472,6 +555,11 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Starting new task %s: %s", task.task_id, task.goal)
         tracer.event("BOOT", f"new task {task.task_id} -- hold the PTT key and speak")
 
+    # Reattach the Computer Use session to whatever `--resume` reloaded (a new
+    # task carries None, so this opens a fresh session on the first CU call).
+    if cu is not None:
+        cu.restore_session(task.interactions_session_id)
+
     stop_event = threading.Event()
     stt_queue: "queue.Queue[str]" = queue.Queue()
 
@@ -489,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
                 task=task,
                 memory=memory,
                 observe_fn=build_observe_fn(stt_queue, mac, task, tracer),
-                ground_fn=build_ground_fn(vision, mac, router, tracer),
+                ground_fn=build_ground_fn(vision, mac, router, settings, cu, tracer),
                 act_fn=build_act_fn(mac, settings),
                 speak_fn=speaker.say,
                 hud=_TracingHud(hud, tracer),

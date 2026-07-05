@@ -49,6 +49,27 @@ class Settings(BaseSettings):
             extra samples and a majority vote. 1 disables escalation.
         ground_confidence: Confidence threshold below which grounding
             escalates to extra samples (when ground_samples > 1).
+        cu_mode: Which grounding route drives the DECIDE tier.
+            "grounding" (default) = the vision path (generate_content ->
+            normalized [ymin,xmin,ymax,xmax] box). "interactions" = the
+            official Computer Use path (client.interactions.create with
+            ENVIRONMENT_DESKTOP, 0..cu_norm_max {x,y} points). The router
+            fast-paths run upstream in BOTH modes; only the model-grounded
+            fallback differs.
+        cu_model_name: Model for the Interactions Computer Use calls. Empty
+            (default) reuses model_name (gemini-3.5-flash ships CU natively).
+        cu_environment: Computer Use environment ("desktop" for OS-level
+            cursor/keyboard control, else "browser"/"mobile").
+        cu_norm_max: Normalization ceiling for the CU {x,y} points. The
+            desktop environment documents 0-999; kept configurable because
+            the SDK's browser samples describe 0-1000 (a ~1px difference).
+        cu_prompt_injection_detection: Enable the API-side prompt-injection
+            check on every Computer Use request (recommended on).
+        cu_scroll_pixels_per_click: Divisor turning a CU scroll's
+            magnitude_in_pixels into pyautogui wheel clicks.
+        cu_timeout_ms: Per-request HTTP timeout for the Interactions CU calls
+            (agentic turns carry a screenshot and can be slower than a plain
+            grounding call).
         push_to_talk_key: Keyboard key held down to record voice input.
         kill_switch_key: Keyboard key that raises the kill-switch event.
         language: STT priming language code (e.g. "fr", "en").
@@ -107,6 +128,14 @@ class Settings(BaseSettings):
     planner_thinking_level: str = Field(default="", alias="PLANNER_THINKING_LEVEL")
     ground_samples: int = Field(default=1, alias="GROUND_SAMPLES")
     ground_confidence: float = Field(default=0.75, alias="GROUND_CONFIDENCE")
+
+    cu_mode: str = Field(default="grounding", alias="CU_MODE")
+    cu_model_name: str = Field(default="", alias="CU_MODEL")
+    cu_environment: str = Field(default="desktop", alias="CU_ENVIRONMENT")
+    cu_norm_max: int = Field(default=999, alias="CU_NORM_MAX")
+    cu_prompt_injection_detection: bool = Field(default=True, alias="CU_PROMPT_INJECTION_DETECTION")
+    cu_scroll_pixels_per_click: int = Field(default=100, alias="CU_SCROLL_PIXELS_PER_CLICK")
+    cu_timeout_ms: int = Field(default=60_000, alias="CU_TIMEOUT_MS")
 
     push_to_talk_key: str = Field(default="f8", alias="PTT_KEY")
     kill_switch_key: str = Field(default="esc", alias="KILL_KEY")
