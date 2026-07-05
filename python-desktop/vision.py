@@ -236,18 +236,26 @@ class GeminiVision:
             f"Notes so far: {step.note or 'none'}\n"
             f"Actions ALREADY executed for this step: {history}\n"
             "You control a real macOS desktop. The LAST image is the CURRENT "
-            "screen; any earlier images are recent history for context only. "
-            "Decide the SINGLE next action to progress this step, targeting "
-            "the CURRENT screen. Do NOT repeat an already-executed action "
-            "that visibly did not progress the step -- try a different one. "
+            "screen; any earlier images are recent history for context only.\n"
+            "FIRST decide whether the step is ALREADY satisfied. Judge only "
+            "what the step itself demands: a step that just clicks/focuses/"
+            "opens something is satisfied once that action appears in the "
+            "executed list and the screen is consistent with it; a step "
+            "demanding visible text or a loaded page needs it visible; an "
+            "outcome invisible on screen (e.g. a clipboard copy) is judged "
+            "from the executed actions alone. If satisfied, reply done.\n"
+            "Otherwise decide the SINGLE next action to progress this step "
+            "on the CURRENT screen. Do NOT repeat an already-executed action "
+            "that did not progress the step -- try a different one. "
             "Reply with ONE JSON object, nothing else:\n"
+            '  {"action":"done"}   (the step is already satisfied)\n'
             '  {"action":"click","box":[ymin,xmin,ymax,xmax]}   (box normalized 0-1000)\n'
             '  {"action":"type","text":"the text to type"}\n'
             '  {"action":"hotkey","keys":["command","v"]}\n'
             '  {"action":"scroll","amount":-5}   (wheel clicks, positive = up)\n'
             '  {"action":"noop"}\n'
             'Also include a "confidence" field (0.0-1.0): your probability '
-            "that this exact action is the right next move."
+            "that this exact answer is right."
         )
         contents = [*self._recent_screenshots, prompt]
 
@@ -392,13 +400,12 @@ class GeminiVision:
             f"Goal: {task.goal}\n"
             f"Step under check: {step.desc}\n"
             f"Actions the agent already executed for this step: {history}\n"
-            "Is this step now complete? Judge from the current screenshot. "
-            "If the step's outcome is NOT visible on a screenshot (e.g. "
-            "copying to the clipboard, a keyboard shortcut with no visual "
-            "effect), judge from the executed actions instead: answer YES "
-            "if they logically complete the step. A step is NOT complete "
-            "just because a field was clicked -- required text must be "
-            "visible, required pages must be loaded. "
+            "Is this step now complete? Judge ONLY what the step itself "
+            "demands: a step that just clicks/focuses/opens something is "
+            "complete once that action was executed and the screen is "
+            "consistent with it; a step demanding visible text or a loaded "
+            "page needs it visible; an outcome invisible on screen (e.g. a "
+            "clipboard copy) is judged from the executed actions alone. "
             "Answer with a single word: YES or NO."
         )
         response = self._generate([screenshot, prompt])
@@ -635,8 +642,8 @@ def _grounded_from_action(action: dict[str, Any], reasoning: str) -> GroundedAct
         return GroundedAction(
             kind="scroll", amount=amount, reasoning=reasoning.strip(), confidence=confidence
         )
-    if kind == "noop":
-        return GroundedAction(kind="noop", reasoning=reasoning.strip(), confidence=confidence)
+    if kind in ("noop", "done"):
+        return GroundedAction(kind=kind, reasoning=reasoning.strip(), confidence=confidence)
     return None
 
 

@@ -393,3 +393,45 @@ def test_act_records_step_history_capped(tmp_path) -> None:
     persisted = memory.load_task_state("HIST-1")
     assert persisted.steps[0].history == step.history, "history survives persistence"
     memory.close()
+
+
+def test_ground_done_plan_advances_step_without_acting(tmp_path) -> None:
+    """The single-call completion path: grounding replies "done" -> the step
+    is marked done, no actuator call, no separate verify round-trip."""
+    memory = MemoryStore(str(tmp_path / "t.db"))
+    task = TaskState(task_id="DONE-1", goal="g", steps=[Step(id="s1", desc="click the field")])
+
+    loop, calls, _spoken = _make_loop(
+        task,
+        memory,
+        [Observation(screenshot="shot") for _ in range(4)],
+        max_turns=10,
+        ground_fn=lambda t, step, obs: ActionPlan(kind="done", step_id=step.id),
+    )
+    summary = loop.run()
+
+    assert summary.status == TaskStatus.DONE.value
+    assert calls == [], "a done verdict never reaches the actuator"
+    memory.close()
+
+
+def test_completes_step_plan_marks_step_done_after_acting(tmp_path) -> None:
+    """Deterministic fast-path plans (type/hotkey) complete on execution."""
+    memory = MemoryStore(str(tmp_path / "t.db"))
+    task = TaskState(task_id="DONE-2", goal="g", steps=[Step(id="s1", desc="Type 'hi'")])
+
+    loop, calls, _spoken = _make_loop(
+        task,
+        memory,
+        [Observation(screenshot="shot") for _ in range(4)],
+        max_turns=10,
+        ground_fn=lambda t, step, obs: ActionPlan(
+            kind="type", step_id=step.id, text="hi", completes_step=True
+        ),
+    )
+    summary = loop.run()
+
+    assert summary.status == TaskStatus.DONE.value
+    assert len(calls) == 1, "typed exactly once, then the step was done"
+    assert task.steps[0].history == ["type: hi"]
+    memory.close()

@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from agent import ActFn, ActionPlan, AgentLoop, GroundFn, Observation, ObserveFn, OverrideFn, PlanFn, VerifyFn
+from agent import ActFn, ActionPlan, AgentLoop, GroundFn, Observation, ObserveFn, OverrideFn, PlanFn
 from config import DEFAULT_GOAL, Settings, is_placeholder_key, load_settings
 from hud import Hud
 from mac_control import MacController, check_macos_permissions, denormalize_box
@@ -154,13 +154,15 @@ def build_ground_fn(
         routed = router.route(step.desc)
         if routed is not None:
             trace.event("ROUTE", f"[{step.id}] fast-path {routed.kind}: {routed.target}")
+            # completes_step: a literal keyboard/open step IS its own
+            # execution -- done on success, no model judgement spent.
             if routed.kind == "type":
-                return ActionPlan(kind="type", step_id=step.id, text=routed.target)
+                return ActionPlan(kind="type", step_id=step.id, text=routed.target, completes_step=True)
             if routed.kind == "hotkey":
-                return ActionPlan(kind="hotkey", step_id=step.id, target=routed.keys)
+                return ActionPlan(kind="hotkey", step_id=step.id, target=routed.keys, completes_step=True)
             if routed.kind == "scroll":
-                return ActionPlan(kind="scroll", step_id=step.id, target=int(routed.target))
-            return ActionPlan(kind=routed.kind, step_id=step.id, text=routed.target)
+                return ActionPlan(kind="scroll", step_id=step.id, target=int(routed.target), completes_step=True)
+            return ActionPlan(kind=routed.kind, step_id=step.id, text=routed.target, completes_step=True)
         if observation.screenshot is None:
             return None
         try:
@@ -178,6 +180,9 @@ def build_ground_fn(
             f"[{step.id}] {step.desc} -> {grounded.kind} (conf {confidence}) :: "
             f"{grounded.reasoning or ''}",
         )
+        if grounded.kind == "done":
+            trace.event("VERIFY", f"[{step.id}] {step.desc} -> already satisfied")
+            return ActionPlan(kind="done", step_id=step.id)
         plan: ActionPlan | None = None
         if grounded.kind == "click" and grounded.box is not None:
             width, height = mac.screen_size_logical()
@@ -225,32 +230,6 @@ def build_plan_fn(vision: GeminiVision, tracer: Any = None) -> PlanFn:
         return steps
 
     return _plan
-
-
-def build_verify_fn(vision: GeminiVision, tracer: Any = None) -> VerifyFn:
-    """Builds the step-completion judge, degrading failures to "not done".
-
-    Args:
-        vision: The Gemini client (its `verify_step_done` does the judging).
-
-    Returns:
-        A callable suitable for `AgentLoop(verify_fn=...)`. On a failed
-        Gemini call the step simply stays in progress -- the safe answer.
-    """
-
-    trace = tracer or NullTracer()
-
-    def _verify(task: TaskState, step: Step, screenshot: Any) -> bool:
-        try:
-            done = vision.verify_step_done(task, step, screenshot)
-        except VisionError as error:
-            logger.warning("verification failed for step %s: %s", step.id, error)
-            trace.event("ERROR", f"[{step.id}] verify failed: {error}")
-            return False
-        trace.event("VERIFY", f"[{step.id}] {step.desc} -> {'DONE' if done else 'not yet'}")
-        return done
-
-    return _verify
 
 
 def build_act_fn(mac: MacController, settings: Settings) -> ActFn:
@@ -517,7 +496,11 @@ def main(argv: list[str] | None = None) -> int:
                 stop_event=stop_event,
                 max_turns=settings.max_turns,
                 plan_fn=build_plan_fn(vision, tracer),
-                verify_fn=build_verify_fn(vision, tracer),
+                # No separate verify_fn: completion is decided by the SAME
+                # grounding call that picks the next action ({"action":"done"}),
+                # so done-vs-act can never contradict and each turn costs one
+                # model round-trip instead of two. Fast-path steps complete
+                # deterministically on execution (completes_step).
                 override_fn=build_override_fn(vision, tracer),
                 idle_sleep_s=settings.loop_idle_sleep_s,
                 max_idle_turns=settings.max_idle_turns,

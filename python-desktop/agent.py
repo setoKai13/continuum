@@ -48,16 +48,23 @@ class ActionPlan:
     """One ACT directive: what the actuator (mac_control) should perform.
 
     Attributes:
-        kind: "click" | "type" | "open_app" | "open_url" | "hotkey" | "noop".
+        kind: "click" | "type" | "open_app" | "open_url" | "hotkey" | "noop"
+            | "scroll" | "done". "done" is not an actuator action: it is the
+            grounding model judging the step already complete on the current
+            screen (the loop marks it done and moves on, single model call).
         step_id: The step this action serves.
         target: Action-specific target (e.g. (x, y) pixel tuple).
         text: Action-specific text payload (typed text, app name, URL...).
+        completes_step: True for deterministic fast-path actions (a literal
+            "type X" / "press cmd+c" step IS its own execution): a successful
+            act marks the step done immediately, no model judgement spent.
     """
 
     kind: str
     step_id: str
     target: Any | None = None
     text: str | None = None
+    completes_step: bool = False
 
 
 @dataclass
@@ -327,6 +334,16 @@ class AgentLoop:
             self._log(turn, f"vision returned no plan for step {step.id} -> stall")
             return "stalled"
 
+        # The grounding model judged the step already satisfied on the
+        # current screen: one call decides done-or-act, so completion and
+        # action can never contradict each other (and each turn pays for
+        # a single model round-trip instead of verify + ground).
+        if plan.kind == "done":
+            self.task.mark_step(step.id, StepStatus.DONE)
+            self.memory.save_task_state(self.task)
+            self._log(turn, f"step {step.id} judged complete by grounding -> next")
+            return "advanced"
+
         if self._plan_is_dangerous(plan):
             self._speak_fn("Refused: that action looks destructive.")
             self.memory.log_tool(self.task.task_id, turn, "refuse", {"plan_kind": plan.kind})
@@ -369,6 +386,13 @@ class AgentLoop:
         detail = plan.text if plan.kind == "type" else plan.target
         step.history.append(f"{plan.kind}: {str(detail)[:80]}" if detail is not None else plan.kind)
         del step.history[:-5]  # the prompts only ever need the recent attempts
+
+        if plan.completes_step:
+            # Deterministic fast-path action: executing it IS completing the
+            # step ("type X", "press cmd+c"). No model judgement needed --
+            # and none could help: these outcomes are often invisible.
+            self.task.mark_step(step.id, StepStatus.DONE)
+            self._log(turn, f"step {step.id} completed by deterministic action")
 
         self.memory.log_tool(self.task.task_id, turn, plan.kind, result)
         self.memory.append_trajectory(
