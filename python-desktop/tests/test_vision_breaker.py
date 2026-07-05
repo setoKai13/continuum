@@ -61,6 +61,7 @@ def _settings(**overrides: Any) -> SimpleNamespace:
         ground_confidence=0.75,
         max_context_screenshots=3,
         gemini_timeout_ms=1000,
+        planner_timeout_ms=2000,
         gemini_max_attempts=3,
         gemini_backoff_s=0.0,
         gemini_breaker_failures=4,

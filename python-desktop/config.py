@@ -78,7 +78,12 @@ class Settings(BaseSettings):
         pyautogui_pause_s: Delay pyautogui inserts between actions.
         ui_settle_s: Pause after each real action so the next screenshot is
             not taken mid-animation.
-        gemini_timeout_ms: Per-request HTTP timeout for Gemini calls.
+        gemini_timeout_ms: Per-request HTTP timeout for the per-turn Gemini
+            calls (grounding): tight, they run every turn.
+        planner_timeout_ms: Per-request timeout for the mastermind calls
+            (planning, override extraction): generous, they run once per
+            instruction and a thinking pro model can exceed 30s (504
+            DEADLINE_EXCEEDED otherwise).
         gemini_max_attempts: Attempts per Gemini call (transient errors only).
         gemini_backoff_s: Base backoff between Gemini retries (linear).
         gemini_breaker_failures: Consecutive failed calls before the circuit
@@ -126,6 +131,7 @@ class Settings(BaseSettings):
     ui_settle_s: float = Field(default=0.8, alias="UI_SETTLE_S")
 
     gemini_timeout_ms: int = Field(default=30_000, alias="GEMINI_TIMEOUT_MS")
+    planner_timeout_ms: int = Field(default=120_000, alias="PLANNER_TIMEOUT_MS")
     gemini_max_attempts: int = Field(default=3, alias="GEMINI_MAX_ATTEMPTS")
     gemini_backoff_s: float = Field(default=0.5, alias="GEMINI_BACKOFF_S")
     gemini_breaker_failures: int = Field(default=4, alias="GEMINI_BREAKER_FAILURES")

@@ -122,7 +122,11 @@ class GeminiVision:
         return self._settings.planner_model_name or self._settings.model_name
 
     def _generate(
-        self, contents: list[Any], model: str | None = None, thinking_level: str | None = None
+        self,
+        contents: list[Any],
+        model: str | None = None,
+        thinking_level: str | None = None,
+        timeout_ms: int | None = None,
     ) -> Any:
         """Calls Gemini `generate_content` with a timeout, retry and breaker.
 
@@ -140,6 +144,10 @@ class GeminiVision:
             thinking_level: Optional Gemini 3 thinking depth for this call
                 (the planner calls pass the configured level); None leaves
                 the model's dynamic default.
+            timeout_ms: Per-request timeout override (the planner calls pass
+                the generous planner_timeout_ms; a thinking pro model can
+                legitimately exceed the tight per-turn deadline). None uses
+                gemini_timeout_ms.
 
         Returns:
             The raw SDK response.
@@ -154,7 +162,7 @@ class GeminiVision:
             raise VisionError("Gemini circuit breaker is open; skipping call")
 
         client = self._ensure_client()
-        config = self._generate_config(thinking_level)
+        config = self._generate_config(thinking_level, timeout_ms)
         extra = {"config": config} if config is not None else {}
 
         max_attempts = self._settings.gemini_max_attempts
@@ -185,12 +193,15 @@ class GeminiVision:
             )
         raise VisionError(f"Gemini call failed: {last_error}")
 
-    def _generate_config(self, thinking_level: str | None = None) -> Any:
+    def _generate_config(
+        self, thinking_level: str | None = None, timeout_ms: int | None = None
+    ) -> Any:
         """Builds a request config carrying an explicit timeout, defensively.
 
         Args:
             thinking_level: Optional Gemini 3 thinking depth to request
                 (e.g. "high" for the mastermind planner calls).
+            timeout_ms: Per-request timeout; None uses gemini_timeout_ms.
 
         Returns:
             A `GenerateContentConfig` with an HTTP timeout (and thinking
@@ -201,7 +212,9 @@ class GeminiVision:
             from google.genai import types  # lazy: SDK dependency
 
             kwargs: dict[str, Any] = {
-                "http_options": types.HttpOptions(timeout=self._settings.gemini_timeout_ms)
+                "http_options": types.HttpOptions(
+                    timeout=timeout_ms or self._settings.gemini_timeout_ms
+                )
             }
             if thinking_level:
                 kwargs["thinking_config"] = types.ThinkingConfig(
@@ -374,6 +387,7 @@ class GeminiVision:
             contents,
             model=self._planner_model(),
             thinking_level=self._settings.planner_thinking_level or None,
+            timeout_ms=self._settings.planner_timeout_ms,
         )
         return self._parse_steps(response)
 
@@ -454,6 +468,7 @@ class GeminiVision:
             [prompt],
             model=self._planner_model(),
             thinking_level=self._settings.planner_thinking_level or None,
+            timeout_ms=self._settings.planner_timeout_ms,
         )
         return _parse_override(getattr(response, "text", None))
 
