@@ -320,3 +320,53 @@ def test_max_idle_turns_bounds_waiting_independently_of_work_budget(tmp_path) ->
     assert summary.tool_calls == 1
     assert summary.turns == 4, "1 work turn + exactly max_idle_turns quiet turns"
     memory.close()
+
+
+def test_keep_alive_survives_completion_and_plans_next_instruction(tmp_path) -> None:
+    """keep_alive=True: finishing every step announces completion but keeps
+    listening; the next instruction revives the task with a fresh plan."""
+    memory = MemoryStore(str(tmp_path / "t.db"))
+    task = TaskState(task_id="ALIVE-1", goal="first job", steps=[Step(id="s1", desc="click A")])
+
+    observations = [
+        Observation(step_completed="s1"),          # finishes the only step
+        Observation(instruction="do a second job"),  # arrives AFTER completion
+        Observation(screenshot="shot"),              # verifies the new step done
+    ]
+    loop, calls, spoken = _make_loop(
+        task,
+        memory,
+        observations,
+        max_turns=20,
+        max_idle_turns=3,
+        keep_alive=True,
+        plan_fn=lambda t, instruction, shot: ["click B"],
+        verify_fn=lambda t, step, shot: True,
+    )
+    summary = loop.run()
+
+    assert any("complete" in s.lower() for s in spoken), "completion announced out loud"
+    assert task.goal == "do a second job", "revival adopts the new instruction as goal"
+    assert [c.step_id for c in calls] == ["s2"], "the revived plan was acted on"
+    assert summary.status == TaskStatus.DONE.value
+    assert task.progress() == (2, 2), "both jobs' steps are done in one session"
+    memory.close()
+
+
+def test_keep_alive_off_exits_on_completion(tmp_path) -> None:
+    """Default behavior unchanged: the run ends as soon as every step is done."""
+    memory = MemoryStore(str(tmp_path / "t.db"))
+    task = TaskState(task_id="ALIVE-2", goal="g", steps=[Step(id="s1", desc="click A")])
+
+    loop, _calls, spoken = _make_loop(
+        task,
+        memory,
+        [Observation(step_completed="s1"), Observation(instruction="more work")],
+        max_turns=20,
+    )
+    summary = loop.run()
+
+    assert summary.status == TaskStatus.DONE.value
+    assert spoken == [], "no keep-alive announcement in the default mode"
+    assert len(task.steps) == 1, "the post-completion instruction was never consumed"
+    memory.close()

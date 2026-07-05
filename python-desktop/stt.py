@@ -9,24 +9,19 @@ without those packages installed.
 
 from __future__ import annotations
 
+import io
 import logging
-import tempfile
 import wave
-from pathlib import Path
 from typing import Any, Callable
 
 from config import Settings
 
 logger = logging.getLogger(__name__)
 
-PRIMING_PROMPT_FR = (
-    "Commandes pour piloter un Mac reel: ouvrir une application, cliquer, taper, "
-    "assigner un ticket a une equipe, reprendre une tache, annuler, arreter."
-)
-PRIMING_PROMPT_EN = (
-    "Commands to control a real Mac: open an application, click, type, "
-    "assign a ticket to a team, resume a task, cancel, stop."
-)
+# A press-and-release shorter than this cannot contain speech: skip the
+# transcription entirely. Whisper handed near-empty audio tends to
+# hallucinate plausible-sounding commands out of nothing.
+MIN_UTTERANCE_S = 0.3
 
 
 class MicrophoneError(Exception):
@@ -78,11 +73,13 @@ class AudioRecorder:
         )
         self._stream.start()
 
-    def stop_and_save(self) -> Path:
-        """Stops recording and writes the buffered audio to a temp WAV file.
+    def stop_and_wav_bytes(self) -> tuple[bytes, float]:
+        """Stops recording and returns the buffered audio as in-memory WAV bytes.
 
         Returns:
-            Path to the written WAV file (caller/OS is responsible for cleanup).
+            A (wav_bytes, duration_seconds) tuple. No temp file touches disk:
+            the bytes go straight into the transcriber (mirroring the
+            wav-bytes -> transcribe shape of the artemis LiveKit wrapper).
 
         Raises:
             MicrophoneError: If no stream was ever started.
@@ -90,23 +87,31 @@ class AudioRecorder:
         import numpy as np  # lazy: ships alongside sounddevice
 
         if self._stream is None:
-            raise MicrophoneError("stop_and_save() called before start()")
+            raise MicrophoneError("stop_and_wav_bytes() called before start()")
         self._stream.stop()
         self._stream.close()
         self._stream = None
 
         audio = np.concatenate(self._frames) if self._frames else np.zeros((0, 1), dtype="int16")
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        with wave.open(tmp.name, "wb") as wav_file:
+        duration_s = len(audio) / self._sample_rate
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)
             wav_file.setframerate(self._sample_rate)
             wav_file.writeframes(audio.tobytes())
-        return Path(tmp.name)
+        return buffer.getvalue(), duration_s
 
 
 class Transcriber:
-    """Offline speech-to-text via faster-whisper, primed for Mac-control commands."""
+    """Offline speech-to-text via faster-whisper.
+
+    Deliberately un-primed: an `initial_prompt` makes whisper echo the prompt
+    back verbatim on silent/near-silent audio, which the agent then treats as
+    a real spoken instruction. `vad_filter=True` stands in for the upstream
+    VAD the artemis LiveKit wrapper gets from Silero -- here the push-to-talk
+    key is the only other gate, so whisper's own VAD must strip the silence.
+    """
 
     def __init__(self, settings: Settings) -> None:
         """Stores settings; the whisper model loads lazily on first use.
@@ -132,19 +137,23 @@ class Transcriber:
         keyboard callback thread."""
         self._ensure_model()
 
-    def transcribe(self, wav_path: Path) -> str:
-        """Transcribes a WAV file, primed with a Mac-control vocabulary hint.
+    def transcribe(self, wav_bytes: bytes) -> str:
+        """Transcribes in-memory WAV audio.
 
         Args:
-            wav_path: Path to a mono 16-bit PCM WAV file.
+            wav_bytes: A mono 16-bit PCM WAV payload.
 
         Returns:
-            The transcript text, stripped, or "" if nothing was recognized.
+            The transcript text, stripped, or "" if nothing was recognized
+            (silence removed by the VAD yields zero segments, not a
+            hallucinated command).
         """
         model = self._ensure_model()
-        prompt = PRIMING_PROMPT_FR if self._settings.language == "fr" else PRIMING_PROMPT_EN
         segments, _info = model.transcribe(
-            str(wav_path), language=self._settings.language, initial_prompt=prompt
+            io.BytesIO(wav_bytes),
+            language=self._settings.language,
+            vad_filter=True,
+            beam_size=5,
         )
         return " ".join(segment.text.strip() for segment in segments).strip()
 
@@ -189,17 +198,16 @@ class PushToTalkListener:
         if not self._held or key != self._target_key:
             return
         self._held = False
-        wav_path: Path | None = None
         try:
-            wav_path = self._recorder.stop_and_save()
-            text = self._transcriber.transcribe(wav_path)
+            wav_bytes, duration_s = self._recorder.stop_and_wav_bytes()
+            if duration_s < MIN_UTTERANCE_S:
+                logger.info("push-to-talk released after %.2fs; too short, ignored", duration_s)
+                return
+            text = self._transcriber.transcribe(wav_bytes)
             if text:
                 self._on_transcript(text)
         except Exception:  # noqa: BLE001 - a pynput callback must never raise
             logger.exception("push-to-talk transcription failed; hold the key and retry")
-        finally:
-            if wav_path is not None:
-                wav_path.unlink(missing_ok=True)
 
     def start(self) -> None:
         """Starts the background keyboard listener thread.

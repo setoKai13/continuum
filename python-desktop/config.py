@@ -39,6 +39,10 @@ class Settings(BaseSettings):
         language: STT priming language code (e.g. "fr", "en").
         whisper_model: faster-whisper model size ("small" default; "base"
             trades accuracy for speed on demo day).
+        keep_alive: When True (default), finishing every step does not end
+            the live run: the agent announces completion, keeps listening,
+            and the next spoken instruction starts a fresh plan in the same
+            session. Set to False to exit as soon as the task completes.
         db_path: Filesystem path to the SQLite hold-state database.
         log_path: File the process logs to (the console belongs to the HUD).
         log_level: Logging level name (DEBUG/INFO/WARNING/ERROR).
@@ -83,6 +87,8 @@ class Settings(BaseSettings):
     db_path: str = Field(default="continuum.db", alias="DB_PATH")
     log_path: str = Field(default="continuum.log", alias="LOG_PATH")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    keep_alive: bool = Field(default=True, alias="KEEP_ALIVE")
 
     max_turns: int = Field(default=120, alias="MAX_TURNS")
     max_idle_turns: int = Field(default=1500, alias="MAX_IDLE_TURNS")

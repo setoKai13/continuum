@@ -407,6 +407,7 @@ def main(argv: list[str] | None = None) -> int:
                 idle_sleep_s=settings.loop_idle_sleep_s,
                 max_idle_turns=settings.max_idle_turns,
                 max_step_attempts=settings.max_step_attempts,
+                keep_alive=settings.keep_alive,
             )
             summary = loop.run()
         finally:

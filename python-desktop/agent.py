@@ -139,6 +139,7 @@ class AgentLoop:
         idle_sleep_s: float = 0.0,
         max_idle_turns: int | None = None,
         max_step_attempts: int = MAX_STEP_ATTEMPTS,
+        keep_alive: bool = False,
     ) -> None:
         """Wires an agent loop with all its collaborators injected.
 
@@ -175,6 +176,11 @@ class AgentLoop:
                 passes a large value so the agent can wait minutes for voice.
             max_step_attempts: Acts allowed on one step before it is marked
                 blocked (reset when an override recalibrates the step).
+            keep_alive: When True, completing every step does NOT end the
+                run: the task is marked done (and announced once), the loop
+                keeps listening, and the next spoken instruction plans a
+                fresh set of steps in the same session. The idle budget
+                still bounds how long the agent waits in silence.
         """
         self.task = task
         self.memory = memory
@@ -191,6 +197,7 @@ class AgentLoop:
         self._idle_sleep_s = idle_sleep_s
         self._max_idle_turns = max_idle_turns
         self._max_step_attempts = max_step_attempts
+        self._keep_alive = keep_alive
         self._attempts: dict[str, int] = {}
 
     def run(self) -> RunSummary:
@@ -226,10 +233,14 @@ class AgentLoop:
                     break
 
                 if self.task.is_complete():
-                    self.task.status = TaskStatus.DONE
-                    self.memory.save_task_state(self.task)
-                    self._log(turn, "all steps done -> task complete")
-                    break
+                    if self.task.status != TaskStatus.DONE:
+                        self.task.status = TaskStatus.DONE
+                        self.memory.save_task_state(self.task)
+                        self._log(turn, "all steps done -> task complete")
+                        if self._keep_alive:
+                            self._speak_fn("Task complete. Listening for the next one.")
+                    if not self._keep_alive:
+                        break
 
                 observation = self._observe_fn()
                 self.memory.append_trajectory(
@@ -478,6 +489,14 @@ class AgentLoop:
         planned = self.task.add_steps(descriptions)
         if planned:
             self.task.add_fact(f"planned {len(planned)} step(s) from instruction")
+            # Keep-alive revival: a completed task that receives a new
+            # instruction becomes active again, with that instruction as the
+            # new goal (the previous goal is already served, its steps stay
+            # done in the history).
+            if self.task.status == TaskStatus.DONE:
+                self.task.status = TaskStatus.ACTIVE
+                if instruction:
+                    self.task.goal = instruction
 
     def _verify_completed(self, step: Step, observation: Observation) -> bool:
         """Returns True if a verifier confirms `step` is done from the screen.
