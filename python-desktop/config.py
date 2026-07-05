@@ -33,7 +33,20 @@ class Settings(BaseSettings):
         gemini_api_key: Required key for the Gemini vision/grounding calls.
         openrouter_api_key: Optional key for the Nemotron selector (bonus path).
         gradium_api_key: Optional key for the Gradium voice sponsor path.
-        model_name: Gemini model used for vision grounding.
+        model_name: Gemini model used for vision grounding and per-turn
+            screen judgement (Computer Use tier: fast, cheap, called every
+            turn).
+        planner_model_name: Optional stronger "mastermind" model used for
+            the reasoning-heavy, once-per-instruction calls (decomposing an
+            instruction into steps, extracting a voice-correction override).
+            Empty (default) means model_name handles everything.
+        planner_thinking_level: Gemini 3 thinking depth (minimal/low/medium/
+            high) for the planner calls. Empty (default) leaves the model's
+            dynamic default; only set on models that support thinking_level.
+        ground_samples: Grounding self-consistency: how many times to ask
+            the vision model where to act, majority-voting the answers.
+            1 (default) = single call; 3 is a strong accuracy/cost trade
+            when API quota is not a concern.
         push_to_talk_key: Keyboard key held down to record voice input.
         kill_switch_key: Keyboard key that raises the kill-switch event.
         language: STT priming language code (e.g. "fr", "en").
@@ -78,6 +91,9 @@ class Settings(BaseSettings):
     gradium_api_key: str | None = Field(default=None, alias="GRADIUM_API_KEY")
 
     model_name: str = Field(default="gemini-3.5-flash", alias="MODEL_NAME")
+    planner_model_name: str = Field(default="", alias="PLANNER_MODEL")
+    planner_thinking_level: str = Field(default="", alias="PLANNER_THINKING_LEVEL")
+    ground_samples: int = Field(default=1, alias="GROUND_SAMPLES")
 
     push_to_talk_key: str = Field(default="f8", alias="PTT_KEY")
     kill_switch_key: str = Field(default="esc", alias="KILL_KEY")

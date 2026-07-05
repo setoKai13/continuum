@@ -24,6 +24,7 @@ class _FakeModels:
 
     def generate_content(self, model: str, contents: Any, **kwargs: Any) -> Any:
         self._outer.calls += 1
+        self._outer.models_seen.append(model)
         if self._outer.calls <= self._outer.failures_before_success:
             raise self._outer.error
         return SimpleNamespace(text="ok")
@@ -34,6 +35,7 @@ class _FakeClient:
 
     def __init__(self, failures_before_success: int = 0, error: Exception | None = None) -> None:
         self.calls = 0
+        self.models_seen: list[str] = []
         self.failures_before_success = failures_before_success
         self.error = error or RuntimeError("transient boom")
         self.models = _FakeModels(self)
@@ -53,6 +55,9 @@ def _settings(**overrides: Any) -> SimpleNamespace:
     base = dict(
         gemini_api_key="",
         model_name="test-model",
+        planner_model_name="",
+        planner_thinking_level="",
+        ground_samples=1,
         max_context_screenshots=3,
         gemini_timeout_ms=1000,
         gemini_max_attempts=3,
@@ -129,3 +134,34 @@ def test_breaker_closes_after_cooldown_and_success_resets() -> None:
     response = vision._generate(["prompt"])
     assert response.text == "ok"
     assert vision._consecutive_failures == 0
+
+
+def test_two_model_split_routes_planner_calls_to_mastermind() -> None:
+    """plan_steps/extract_override use PLANNER_MODEL; ground/verify keep MODEL_NAME."""
+    from state import Step, TaskState
+
+    client = _FakeClient()
+    vision = _vision_with(client, planner_model_name="mastermind-model")
+    task = TaskState(task_id="T", goal="g", steps=[Step(id="s1", desc="click A")])
+
+    vision.plan_steps(task, "do something", screenshot=None)
+    vision.extract_override(task, "non, en fait fais B")
+    vision.ground(task, task.steps[0], screenshot="shot")
+    vision.verify_step_done(task, task.steps[0], screenshot="shot")
+
+    assert client.models_seen == [
+        "mastermind-model",  # plan_steps -> reasoning tier
+        "mastermind-model",  # extract_override -> reasoning tier
+        "test-model",        # ground -> computer-use tier
+        "test-model",        # verify_step_done -> computer-use tier
+    ]
+
+
+def test_planner_model_falls_back_to_grounding_model_when_unset() -> None:
+    from state import TaskState
+
+    client = _FakeClient()
+    vision = _vision_with(client)  # planner_model_name=""
+    vision.plan_steps(TaskState(task_id="T", goal="g"), "do something", screenshot=None)
+
+    assert client.models_seen == ["test-model"]

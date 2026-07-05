@@ -154,3 +154,49 @@ def test_parse_response_fallbacks() -> None:
     # Nothing parseable at all -> explicit noop, never an exception.
     noop = vision._parse_response(SimpleNamespace(text="I am not sure what to do"))
     assert noop.kind == "noop"
+
+
+def test_vote_grounded_majority_kind_wins() -> None:
+    from vision import GroundedAction, _vote_grounded
+
+    actions = [
+        GroundedAction(kind="click", box=(100, 100, 120, 120)),
+        GroundedAction(kind="click", box=(102, 98, 122, 118)),
+        GroundedAction(kind="noop"),
+    ]
+    voted = _vote_grounded(actions)
+    assert voted.kind == "click", "2 clicks outvote 1 noop"
+
+
+def test_vote_grounded_clusters_clicks_never_averages_distinct_targets() -> None:
+    """Two samples on button A, one on faraway button B: the consensus click
+    must land ON A, not at the meaningless midpoint between A and B."""
+    from vision import GroundedAction, _vote_grounded
+
+    actions = [
+        GroundedAction(kind="click", box=(100, 100, 120, 120)),   # A
+        GroundedAction(kind="click", box=(104, 96, 124, 116)),    # A (jitter)
+        GroundedAction(kind="click", box=(800, 800, 820, 820)),   # B (outlier)
+    ]
+    voted = _vote_grounded(actions)
+    center_y = (voted.box[0] + voted.box[2]) / 2
+    center_x = (voted.box[1] + voted.box[3]) / 2
+    assert center_y < 200 and center_x < 200, "consensus stays on target A"
+
+
+def test_vote_grounded_type_picks_most_common_text() -> None:
+    from vision import GroundedAction, _vote_grounded
+
+    actions = [
+        GroundedAction(kind="type", text="bonjour"),
+        GroundedAction(kind="type", text="bonjour"),
+        GroundedAction(kind="type", text="bonjour!"),
+    ]
+    assert _vote_grounded(actions).text == "bonjour"
+
+
+def test_vote_grounded_single_sample_passthrough() -> None:
+    from vision import GroundedAction, _vote_grounded
+
+    only = GroundedAction(kind="hotkey", keys=["command", "v"])
+    assert _vote_grounded([only]) is only

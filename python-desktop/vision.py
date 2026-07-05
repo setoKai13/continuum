@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -105,7 +106,17 @@ class GeminiVision:
         if len(self._recent_screenshots) > budget:
             self._recent_screenshots = self._recent_screenshots[-budget:]
 
-    def _generate(self, contents: list[Any]) -> Any:
+    def _planner_model(self) -> str:
+        """Returns the mastermind model for reasoning-heavy calls.
+
+        Falls back to the grounding model when PLANNER_MODEL is unset, so a
+        single-model configuration keeps working unchanged.
+        """
+        return self._settings.planner_model_name or self._settings.model_name
+
+    def _generate(
+        self, contents: list[Any], model: str | None = None, thinking_level: str | None = None
+    ) -> Any:
         """Calls Gemini `generate_content` with a timeout, retry and breaker.
 
         This is the single outbound network dependency the agent hits every
@@ -117,6 +128,11 @@ class GeminiVision:
 
         Args:
             contents: The `generate_content` contents (screenshots + prompt).
+            model: Model override for this call (the planner/mastermind
+                calls pass one); None uses the grounding `model_name`.
+            thinking_level: Optional Gemini 3 thinking depth for this call
+                (the planner calls pass the configured level); None leaves
+                the model's dynamic default.
 
         Returns:
             The raw SDK response.
@@ -131,7 +147,7 @@ class GeminiVision:
             raise VisionError("Gemini circuit breaker is open; skipping call")
 
         client = self._ensure_client()
-        config = self._generate_config()
+        config = self._generate_config(thinking_level)
         extra = {"config": config} if config is not None else {}
 
         max_attempts = self._settings.gemini_max_attempts
@@ -139,7 +155,7 @@ class GeminiVision:
         for attempt in range(1, max_attempts + 1):
             try:
                 response = client.models.generate_content(
-                    model=self._settings.model_name, contents=contents, **extra
+                    model=model or self._settings.model_name, contents=contents, **extra
                 )
                 self._consecutive_failures = 0
                 return response
@@ -162,19 +178,29 @@ class GeminiVision:
             )
         raise VisionError(f"Gemini call failed: {last_error}")
 
-    def _generate_config(self) -> Any:
+    def _generate_config(self, thinking_level: str | None = None) -> Any:
         """Builds a request config carrying an explicit timeout, defensively.
 
+        Args:
+            thinking_level: Optional Gemini 3 thinking depth to request
+                (e.g. "high" for the mastermind planner calls).
+
         Returns:
-            A `GenerateContentConfig` with an HTTP timeout, or None if the
-            installed SDK does not expose that surface (so the call still runs).
+            A `GenerateContentConfig` with an HTTP timeout (and thinking
+            config when requested), or None if the installed SDK does not
+            expose that surface (so the call still runs).
         """
         try:
             from google.genai import types  # lazy: SDK dependency
 
-            return types.GenerateContentConfig(
-                http_options=types.HttpOptions(timeout=self._settings.gemini_timeout_ms)
-            )
+            kwargs: dict[str, Any] = {
+                "http_options": types.HttpOptions(timeout=self._settings.gemini_timeout_ms)
+            }
+            if thinking_level:
+                kwargs["thinking_config"] = types.ThinkingConfig(
+                    thinking_level=thinking_level.upper()
+                )
+            return types.GenerateContentConfig(**kwargs)
         except Exception as error:  # noqa: BLE001 - timeout is best-effort, never fatal
             logger.warning("could not build a per-request timeout config: %s", error)
             return None
@@ -212,8 +238,22 @@ class GeminiVision:
         )
         contents = [*self._recent_screenshots, prompt]
 
-        response = self._generate(contents)
-        return self._parse_response(response)
+        # Grounding self-consistency: with quota to spare, sample the model
+        # several times and majority-vote the answers -- one hallucinated
+        # click among N gets outvoted instead of executed.
+        samples = max(1, self._settings.ground_samples)
+        actions: list[GroundedAction] = []
+        last_error: VisionError | None = None
+        for _ in range(samples):
+            try:
+                response = self._generate(contents)
+            except VisionError as error:
+                last_error = error
+                continue
+            actions.append(self._parse_response(response))
+        if not actions:
+            raise last_error or VisionError("no grounding sample succeeded")
+        return _vote_grounded(actions)
 
     def _parse_response(self, response: Any) -> GroundedAction:
         """Extracts a GroundedAction out of a `generate_content` response.
@@ -281,7 +321,11 @@ class GeminiVision:
         )
         contents = [*visual_parts, prompt]
 
-        response = self._generate(contents)
+        response = self._generate(
+            contents,
+            model=self._planner_model(),
+            thinking_level=self._settings.planner_thinking_level or None,
+        )
         return self._parse_steps(response)
 
     def verify_step_done(self, task: TaskState, step: Step, screenshot: Any) -> bool:
@@ -350,7 +394,11 @@ class GeminiVision:
             'descriptions>","rule":"<the corrected rule, one imperative sentence>"}\n'
             '  {"correction":false}'
         )
-        response = self._generate([prompt])
+        response = self._generate(
+            [prompt],
+            model=self._planner_model(),
+            thinking_level=self._settings.planner_thinking_level or None,
+        )
         return _parse_override(getattr(response, "text", None))
 
     def _parse_steps(self, response: Any) -> list[str]:
@@ -376,6 +424,69 @@ class GeminiVision:
         if not isinstance(data, list):
             return []
         return [str(item).strip() for item in data if str(item).strip()][:_MAX_PLAN_STEPS]
+
+
+# Two click samples whose centers are both within this normalized distance
+# (out of 1000) count as votes for the SAME target; farther apart, they are
+# different UI elements and must not be averaged into a point between them.
+_CLICK_CLUSTER_TOLERANCE = 50.0
+
+
+def _vote_grounded(actions: list[GroundedAction]) -> GroundedAction:
+    """Majority-votes N grounding samples into one action (self-consistency).
+
+    The winning `kind` is the most common one. Within the winning kind:
+    clicks are clustered by proximity (the densest cluster wins and its
+    boxes are averaged -- never averaging across distinct targets), text
+    and hotkeys go to the most common value, scroll takes the median.
+
+    Args:
+        actions: One parsed GroundedAction per sample (at least one).
+
+    Returns:
+        The consensus action.
+    """
+    if len(actions) == 1:
+        return actions[0]
+
+    winning_kind = Counter(a.kind for a in actions).most_common(1)[0][0]
+    cluster = [a for a in actions if a.kind == winning_kind]
+
+    if winning_kind == "click":
+        boxes = [a.box for a in cluster if a.box is not None]
+        if not boxes:
+            return cluster[0]
+        centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in boxes]
+
+        def neighborhood(i: int) -> list[int]:
+            return [
+                j
+                for j, (cy, cx) in enumerate(centers)
+                if abs(cy - centers[i][0]) <= _CLICK_CLUSTER_TOLERANCE
+                and abs(cx - centers[i][1]) <= _CLICK_CLUSTER_TOLERANCE
+            ]
+
+        anchor = max(range(len(boxes)), key=lambda i: len(neighborhood(i)))
+        group = neighborhood(anchor)
+        consensus_box = tuple(
+            sum(boxes[j][k] for j in group) / len(group) for k in range(4)
+        )
+        return GroundedAction(
+            kind="click", box=consensus_box, reasoning=cluster[anchor].reasoning
+        )
+    if winning_kind == "type":
+        text = Counter(a.text for a in cluster).most_common(1)[0][0]
+        return next(a for a in cluster if a.text == text)
+    if winning_kind == "hotkey":
+        keys = Counter(tuple(a.keys or ()) for a in cluster).most_common(1)[0][0]
+        return next(a for a in cluster if tuple(a.keys or ()) == keys)
+    if winning_kind == "scroll":
+        amounts = sorted(a.amount or 0 for a in cluster)
+        median = amounts[len(amounts) // 2]
+        return GroundedAction(
+            kind="scroll", amount=median, reasoning=cluster[0].reasoning
+        )
+    return cluster[0]
 
 
 def _is_transient_error(error: Exception) -> bool:
