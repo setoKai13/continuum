@@ -1,0 +1,31 @@
+# Environnement et secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build / distribution
+dist/
+build/
+
+# Bases de donnees locales (hold-state SQLite)
+*.db
+
+# OS et editeurs
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Logs
+*.log

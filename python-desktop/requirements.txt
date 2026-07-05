@@ -1,0 +1,39 @@
+# Continuum -- full live dependency set.
+#
+# For headless builds/tests/CI, only install the minimal gate set:
+#   pip install pydantic pydantic-settings pytest rich
+# Everything below GUI/network is imported LAZILY (inside functions), so
+# pytest / scripts/dry_run.py / `python -c "import main"` never need it.
+# Install the rest ONLY on the machine that will run the live demo.
+
+# -- config / core (minimal gate set) --
+pydantic>=2.6
+pydantic-settings>=2.2
+pytest>=8.0
+rich>=13.7
+
+# -- Gemini (cerveau + grounding) --
+# >=1.0 required: the per-request GenerateContentConfig(http_options=...)
+# timeout surface does not exist in older releases (vision.py would then
+# silently call without a timeout).
+google-genai>=1.0
+
+# -- Mac desktop control (actionneur) --
+pyautogui>=0.9.54
+mss>=9.0
+pillow>=10.0
+
+# -- Voice: push-to-talk STT + hotkeys --
+sounddevice>=0.4.6
+faster-whisper>=1.0
+pynput>=1.7.6
+# stt.py uses numpy directly (frame concat); listed explicitly rather than
+# relying on it arriving transitively via faster-whisper.
+numpy>=1.26
+
+# -- TTS fallback (macOS `say` is tried first, this is the portable fallback) --
+pyttsx3>=2.90
+
+# -- optional sponsor paths (config.py reads keys even if unused) --
+# openai>=1.0          # OpenRouter/Nemotron client (chat.completions compatible)
+# gradium              # Gradium voice sponsor SDK
