@@ -58,6 +58,7 @@ def _settings(**overrides: Any) -> SimpleNamespace:
         planner_model_name="",
         planner_thinking_level="",
         ground_samples=1,
+        ground_confidence=0.75,
         max_context_screenshots=3,
         gemini_timeout_ms=1000,
         gemini_max_attempts=3,
@@ -165,3 +166,65 @@ def test_planner_model_falls_back_to_grounding_model_when_unset() -> None:
     vision.plan_steps(TaskState(task_id="T", goal="g"), "do something", screenshot=None)
 
     assert client.models_seen == ["test-model"]
+
+
+class _ScriptedModels:
+    """client.models fake replying with a scripted text per call."""
+
+    def __init__(self, outer: "_ScriptedClient") -> None:
+        self._outer = outer
+
+    def generate_content(self, model: str, contents: Any, **kwargs: Any) -> Any:
+        self._outer.calls += 1
+        text = self._outer.texts[min(self._outer.calls - 1, len(self._outer.texts) - 1)]
+        return SimpleNamespace(text=text)
+
+
+class _ScriptedClient:
+    def __init__(self, texts: list[str]) -> None:
+        self.calls = 0
+        self.texts = texts
+        self.models = _ScriptedModels(self)
+
+
+def _ground_task():
+    from state import Step, TaskState
+
+    return TaskState(task_id="T", goal="g", steps=[Step(id="s1", desc="click A")])
+
+
+def test_confident_grounding_acts_on_a_single_call() -> None:
+    client = _ScriptedClient(['{"action":"click","box":[10,10,20,20],"confidence":0.95}'])
+    vision = _vision_with(client, ground_samples=3)
+
+    action = vision.ground(_ground_task(), _ground_task().steps[0], screenshot="shot")
+
+    assert client.calls == 1, "a confident answer never pays for extra samples"
+    assert action.kind == "click" and action.confidence == 0.95
+
+
+def test_uncertain_grounding_escalates_to_vote() -> None:
+    client = _ScriptedClient(
+        [
+            '{"action":"click","box":[10,10,20,20],"confidence":0.3}',
+            '{"action":"click","box":[12,8,22,18],"confidence":0.6}',
+            '{"action":"click","box":[500,500,520,520],"confidence":0.5}',
+        ]
+    )
+    vision = _vision_with(client, ground_samples=3)
+
+    action = vision.ground(_ground_task(), _ground_task().steps[0], screenshot="shot")
+
+    assert client.calls == 3, "low confidence buys the full sample budget"
+    assert action.kind == "click"
+    assert action.box[0] < 100, "the two near-agreeing clicks outvote the outlier"
+
+
+def test_missing_confidence_does_not_escalate() -> None:
+    client = _ScriptedClient(['{"action":"type","text":"bonjour"}'])
+    vision = _vision_with(client, ground_samples=3)
+
+    action = vision.ground(_ground_task(), _ground_task().steps[0], screenshot="shot")
+
+    assert client.calls == 1, "a non-compliant reply must not silently triple latency"
+    assert action.kind == "type" and action.confidence is None

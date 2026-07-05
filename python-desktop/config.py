@@ -43,10 +43,12 @@ class Settings(BaseSettings):
         planner_thinking_level: Gemini 3 thinking depth (minimal/low/medium/
             high) for the planner calls. Empty (default) leaves the model's
             dynamic default; only set on models that support thinking_level.
-        ground_samples: Grounding self-consistency: how many times to ask
-            the vision model where to act, majority-voting the answers.
-            1 (default) = single call; 3 is a strong accuracy/cost trade
-            when API quota is not a concern.
+        ground_samples: CAP on grounding self-consistency samples. The model
+            reports a confidence with each action: confident answers act on
+            the first (fast) call, only low-confidence ones escalate to
+            extra samples and a majority vote. 1 disables escalation.
+        ground_confidence: Confidence threshold below which grounding
+            escalates to extra samples (when ground_samples > 1).
         push_to_talk_key: Keyboard key held down to record voice input.
         kill_switch_key: Keyboard key that raises the kill-switch event.
         language: STT priming language code (e.g. "fr", "en").
@@ -94,6 +96,7 @@ class Settings(BaseSettings):
     planner_model_name: str = Field(default="", alias="PLANNER_MODEL")
     planner_thinking_level: str = Field(default="", alias="PLANNER_THINKING_LEVEL")
     ground_samples: int = Field(default=1, alias="GROUND_SAMPLES")
+    ground_confidence: float = Field(default=0.75, alias="GROUND_CONFIDENCE")
 
     push_to_talk_key: str = Field(default="f8", alias="PTT_KEY")
     kill_switch_key: str = Field(default="esc", alias="KILL_KEY")

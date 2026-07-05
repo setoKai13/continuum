@@ -48,6 +48,9 @@ class GroundedAction:
         keys: Hotkey chord (e.g. ["command", "v"]), if any.
         amount: Scroll wheel clicks (positive = up), if any.
         reasoning: The model's free-text rationale (for the HUD/log).
+        confidence: The model's self-reported probability (0..1) that this
+            action is right; None when the model omitted it. Drives the
+            adaptive escalation in `ground()`.
     """
 
     kind: str
@@ -56,6 +59,7 @@ class GroundedAction:
     keys: list[str] | None = None
     amount: int | None = None
     reasoning: str | None = None
+    confidence: float | None = None
 
 
 class GeminiVision:
@@ -234,26 +238,47 @@ class GeminiVision:
             '  {"action":"type","text":"the text to type"}\n'
             '  {"action":"hotkey","keys":["command","v"]}\n'
             '  {"action":"scroll","amount":-5}   (wheel clicks, positive = up)\n'
-            '  {"action":"noop"}'
+            '  {"action":"noop"}\n'
+            'Also include a "confidence" field (0.0-1.0): your probability '
+            "that this exact action is the right next move."
         )
         contents = [*self._recent_screenshots, prompt]
 
-        # Grounding self-consistency: with quota to spare, sample the model
-        # several times and majority-vote the answers -- one hallucinated
-        # click among N gets outvoted instead of executed.
-        samples = max(1, self._settings.ground_samples)
-        actions: list[GroundedAction] = []
-        last_error: VisionError | None = None
-        for _ in range(samples):
+        # Adaptive self-consistency: the model reports its own confidence.
+        # A confident first answer acts immediately (single fast call); only
+        # a low-confidence one escalates to extra samples + majority vote,
+        # so the latency cost is paid exactly on the turns that need it.
+        first = self._parse_response(self._generate(contents))
+        samples_cap = max(1, self._settings.ground_samples)
+        if samples_cap == 1 or not self._is_uncertain(first):
+            return first
+
+        logger.info(
+            "grounding confidence %.2f below %.2f -> escalating to %d-sample vote",
+            first.confidence if first.confidence is not None else -1.0,
+            self._settings.ground_confidence,
+            samples_cap,
+        )
+        actions = [first]
+        for _ in range(samples_cap - 1):
             try:
                 response = self._generate(contents)
             except VisionError as error:
-                last_error = error
+                logger.warning("extra grounding sample failed: %s", error)
                 continue
             actions.append(self._parse_response(response))
-        if not actions:
-            raise last_error or VisionError("no grounding sample succeeded")
         return _vote_grounded(actions)
+
+    def _is_uncertain(self, action: GroundedAction) -> bool:
+        """True when a grounded action's self-reported confidence is too low.
+
+        A missing confidence (model ignored the instruction) counts as
+        confident: escalating on every non-compliant reply would silently
+        triple latency, and the parse fallbacks already handle those cases.
+        """
+        if action.confidence is None:
+            return False
+        return action.confidence < self._settings.ground_confidence
 
     def _parse_response(self, response: Any) -> GroundedAction:
         """Extracts a GroundedAction out of a `generate_content` response.
@@ -549,6 +574,7 @@ def _grounded_from_action(action: dict[str, Any], reasoning: str) -> GroundedAct
         model output must NEVER crash the loop.
     """
     kind = str(action.get("action", "")).lower()
+    confidence = _parse_confidence(action.get("confidence"))
     if kind == "click":
         box = action.get("box")
         if isinstance(box, list) and len(box) == 4:
@@ -556,27 +582,56 @@ def _grounded_from_action(action: dict[str, Any], reasoning: str) -> GroundedAct
                 parsed_box = tuple(float(v) for v in box)
             except (TypeError, ValueError):
                 return None
-            return GroundedAction(kind="click", box=parsed_box, reasoning=reasoning.strip())
+            return GroundedAction(
+                kind="click", box=parsed_box, reasoning=reasoning.strip(), confidence=confidence
+            )
         return None
     if kind == "type":
         text = action.get("text")
         if isinstance(text, str) and text:
-            return GroundedAction(kind="type", text=text, reasoning=reasoning.strip())
+            return GroundedAction(
+                kind="type", text=text, reasoning=reasoning.strip(), confidence=confidence
+            )
         return None
     if kind == "hotkey":
         keys = action.get("keys")
         if isinstance(keys, list) and keys:
-            return GroundedAction(kind="hotkey", keys=[str(k) for k in keys], reasoning=reasoning.strip())
+            return GroundedAction(
+                kind="hotkey",
+                keys=[str(k) for k in keys],
+                reasoning=reasoning.strip(),
+                confidence=confidence,
+            )
         return None
     if kind == "scroll":
         try:
             amount = int(action.get("amount"))
         except (TypeError, ValueError):
             return None
-        return GroundedAction(kind="scroll", amount=amount, reasoning=reasoning.strip())
+        return GroundedAction(
+            kind="scroll", amount=amount, reasoning=reasoning.strip(), confidence=confidence
+        )
     if kind == "noop":
-        return GroundedAction(kind="noop", reasoning=reasoning.strip())
+        return GroundedAction(kind="noop", reasoning=reasoning.strip(), confidence=confidence)
     return None
+
+
+def _parse_confidence(value: Any) -> float | None:
+    """Parses a model-reported confidence, tolerating junk.
+
+    Args:
+        value: The raw "confidence" JSON value (number, string, or garbage).
+
+    Returns:
+        The confidence clamped to [0.0, 1.0], or None if unparseable --
+        a malformed confidence must never invalidate an otherwise good
+        action, it just opts out of the escalation heuristic.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return min(max(parsed, 0.0), 1.0)
 
 
 def _parse_override(text: str | None) -> tuple[str, str] | None:
