@@ -107,17 +107,79 @@ def is_correction(instruction: str) -> bool:
     return bool(_CORRECTION_RE.search(instruction))
 
 
+# Steps the planner writes as literal keyboard work ("Type 'X'", "Press
+# cmd+l") carry their whole meaning in the text: sending them to vision
+# grounding invites the model to improvise (e.g. click the field again
+# instead of typing). These fast paths execute them deterministically.
+_TYPE_VERB_RE = re.compile(r"^(?:type|write|tape[rz]?|saisis?|[ée]cri[st])\b", re.IGNORECASE)
+_QUOTED_TEXT_RE = re.compile(r"['\"“‘«]\s*(?P<text>[^'\"“”‘’«»]+?)\s*['\"”’»]")
+_PRESS_COMBO_RE = re.compile(
+    r"^(?:press|hit|appuie[rz]?(?:\s+sur)?|presse[rz]?)\s+(?P<combo>[A-Za-z0-9+ ]+?)"
+    r"(?:\s+(?:to|pour)\b.*)?\s*[.!]?$",
+    re.IGNORECASE,
+)
+_SCROLL_STEP_RE = re.compile(r"^(?:scroll|d[ée]file[rz]?)\s+(?P<direction>down|up|bas|haut)\b", re.IGNORECASE)
+
+# Alias -> pyautogui key name. Any token not resolvable to a known key means
+# the phrase is NOT a hotkey ("press the New Note button" -> vision).
+_KEY_ALIASES = {
+    "cmd": "command",
+    "control": "ctrl",
+    "opt": "option",
+    "return": "enter",
+    "entree": "enter",
+    "entrée": "enter",
+    "escape": "esc",
+    "echap": "esc",
+    "échap": "esc",
+    "del": "delete",
+    "suppr": "delete",
+    "espace": "space",
+    "maj": "shift",
+}
+_KNOWN_KEYS = {
+    "command", "ctrl", "option", "alt", "shift", "fn", "enter", "esc", "tab",
+    "space", "delete", "backspace", "up", "down", "left", "right", "home",
+    "end", "pageup", "pagedown",
+} | {f"f{i}" for i in range(1, 13)}
+
+
+def _parse_key_combo(combo: str) -> tuple[str, ...] | None:
+    """Parses "cmd+l" / "Enter" / "cmd + shift + t" into pyautogui key names.
+
+    Args:
+        combo: The raw combo text captured after the press verb.
+
+    Returns:
+        A tuple of normalized key names, or None if ANY token is not a
+        recognizable key (then the phrase is a UI description, not a chord).
+    """
+    tokens = [t for t in re.split(r"[+\s]+", combo.strip().lower()) if t]
+    if not tokens:
+        return None
+    keys: list[str] = []
+    for token in tokens:
+        mapped = _KEY_ALIASES.get(token, token)
+        if mapped in _KNOWN_KEYS or (len(mapped) == 1 and mapped.isalnum()):
+            keys.append(mapped)
+            continue
+        return None
+    return tuple(keys)
+
+
 @dataclass(frozen=True)
 class RoutedIntent:
     """Result of a successful zero-LLM fast-path match.
 
     Attributes:
-        kind: "open_url" or "open_app".
-        target: The URL or application name to open.
+        kind: "open_url" | "open_app" | "type" | "hotkey" | "scroll".
+        target: URL, app name, text to type, or scroll amount (as str).
+        keys: Normalized key chord, for kind="hotkey" only.
     """
 
     kind: str
     target: str
+    keys: tuple[str, ...] | None = None
 
 
 class IntentRouter:
@@ -157,5 +219,29 @@ class IntentRouter:
             if _APP_NOT_A_NAME_RE.search(app):
                 return None
             return RoutedIntent(kind="open_app", target=app)
+
+        # "Type '...'": the exact text is in the step -- execute it, never
+        # ask vision (which tends to re-click the field instead of typing).
+        # Unquoted typing ("type the message") stays with vision: the text
+        # is not literally spelled out.
+        if _TYPE_VERB_RE.match(stripped):
+            quoted = _QUOTED_TEXT_RE.search(stripped)
+            if quoted:
+                return RoutedIntent(kind="type", target=quoted.group("text"))
+            return None
+
+        # "Press cmd+l" / "Press Enter": a literal key chord. "Press the
+        # New Note button" has non-key tokens and falls through to vision.
+        press_match = _PRESS_COMBO_RE.match(stripped)
+        if press_match:
+            keys = _parse_key_combo(press_match.group("combo"))
+            if keys is not None:
+                return RoutedIntent(kind="hotkey", target="+".join(keys), keys=keys)
+
+        scroll_match = _SCROLL_STEP_RE.match(stripped)
+        if scroll_match:
+            direction = scroll_match.group("direction").lower()
+            amount = -5 if direction in ("down", "bas") else 5
+            return RoutedIntent(kind="scroll", target=str(amount))
 
         return None

@@ -45,12 +45,19 @@ class TaskStatus(str, Enum):
 
 
 class Step(BaseModel):
-    """A single unit of work inside a task plan."""
+    """A single unit of work inside a task plan.
+
+    `history` records the concrete actions already executed for this step
+    (last few only). It feeds two prompts: grounding (do not repeat what
+    did not work) and verification (an outcome invisible on screen, like a
+    clipboard copy, can be judged from the actions instead of the pixels).
+    """
 
     id: str
     desc: str
     status: StepStatus = StepStatus.TODO
     note: str | None = None
+    history: list[str] = Field(default_factory=list)
 
 
 class Override(BaseModel):

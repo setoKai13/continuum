@@ -82,3 +82,45 @@ def test_is_correction_false_for_plain_instructions() -> None:
     assert is_correction("triage the network bugs") is False
     assert is_correction("process the queue") is False
     assert is_correction("note the ticket number") is False
+
+
+def test_route_type_step_with_quoted_text_is_deterministic() -> None:
+    """The exact bug from the live run: "Type 'simple recipes'." must become
+    a type action, never a vision call that re-clicks the field."""
+    router = IntentRouter()
+    routed = router.route("Type 'simple recipes'.")
+    assert routed is not None
+    assert routed.kind == "type" and routed.target == "simple recipes"
+
+
+def test_route_type_step_without_quotes_falls_through_to_vision() -> None:
+    router = IntentRouter()
+    assert router.route("type the message to the team") is None
+
+
+def test_route_press_key_combo() -> None:
+    router = IntentRouter()
+    routed = router.route("Press cmd+l to focus the address bar.")
+    assert routed is not None
+    assert routed.kind == "hotkey" and routed.keys == ("command", "l")
+
+
+def test_route_press_enter_alone() -> None:
+    router = IntentRouter()
+    routed = router.route("Press Enter.")
+    assert routed is not None
+    assert routed.kind == "hotkey" and routed.keys == ("enter",)
+
+
+def test_route_press_ui_button_is_not_a_hotkey() -> None:
+    """'Press the New Note button' describes a click target, not a chord."""
+    router = IntentRouter()
+    assert router.route("Press the New Note button in the toolbar.") is None
+
+
+def test_route_scroll_direction() -> None:
+    router = IntentRouter()
+    down = router.route("Scroll down to see more results")
+    assert down is not None and down.kind == "scroll" and down.target == "-5"
+    up = router.route("scroll up")
+    assert up is not None and up.target == "5"

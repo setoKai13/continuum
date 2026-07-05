@@ -60,6 +60,11 @@ class Settings(BaseSettings):
             session. Set to False to exit as soon as the task completes.
         db_path: Filesystem path to the SQLite hold-state database.
         log_path: File the process logs to (the console belongs to the HUD).
+        trace_path: File the live trace stream is written to (truncated at
+            each boot; the debug console window tails it).
+        debug_console: When True (default), main.py opens a second Terminal
+            window at launch showing the live trace: what the model heard,
+            planned, reasoned, decided, and every loop event.
         log_level: Logging level name (DEBUG/INFO/WARNING/ERROR).
         max_turns: Ceiling on WORK turns (turns that carry an observation);
             idle waiting does not consume this budget.
@@ -105,6 +110,8 @@ class Settings(BaseSettings):
 
     db_path: str = Field(default="continuum.db", alias="DB_PATH")
     log_path: str = Field(default="continuum.log", alias="LOG_PATH")
+    trace_path: str = Field(default="continuum-trace.log", alias="TRACE_PATH")
+    debug_console: bool = Field(default=True, alias="DEBUG_CONSOLE")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     keep_alive: bool = Field(default=True, alias="KEEP_ALIVE")

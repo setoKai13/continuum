@@ -132,8 +132,10 @@ def test_parse_steps_happy_path_and_cap() -> None:
     reply = SimpleNamespace(text='Here you go:\n["open Slack", "  ", "click #general", "type hi"]')
     assert vision._parse_steps(reply) == ["open Slack", "click #general", "type hi"]
 
-    too_many = SimpleNamespace(text=str([f"step {i}" for i in range(12)]).replace("'", '"'))
-    assert len(vision._parse_steps(too_many)) == 6, "the planner cap bounds the parsed list"
+    from vision import _MAX_PLAN_STEPS
+
+    too_many = SimpleNamespace(text=str([f"step {i}" for i in range(_MAX_PLAN_STEPS + 2)]).replace("'", '"'))
+    assert len(vision._parse_steps(too_many)) == _MAX_PLAN_STEPS, "the planner cap bounds the parsed list"
 
 
 def test_parse_steps_malformed_replies_yield_empty_plan() -> None:

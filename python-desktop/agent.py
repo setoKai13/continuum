@@ -366,6 +366,10 @@ class AgentLoop:
             self._log(turn, f"action [{plan.kind}] failed on step {step.id}: {error}")
             return "stalled"
 
+        detail = plan.text if plan.kind == "type" else plan.target
+        step.history.append(f"{plan.kind}: {str(detail)[:80]}" if detail is not None else plan.kind)
+        del step.history[:-5]  # the prompts only ever need the recent attempts
+
         self.memory.log_tool(self.task.task_id, turn, plan.kind, result)
         self.memory.append_trajectory(
             self.task.task_id, {"turn": turn, "type": "act", "kind": plan.kind, "step_id": step.id}

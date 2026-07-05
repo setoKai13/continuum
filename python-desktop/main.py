@@ -21,6 +21,7 @@ import queue
 import sys
 import threading
 import uuid
+from pathlib import Path
 from typing import Any
 
 from agent import ActFn, ActionPlan, AgentLoop, GroundFn, Observation, ObserveFn, OverrideFn, PlanFn, VerifyFn
@@ -30,6 +31,7 @@ from mac_control import MacController, check_macos_permissions, denormalize_box
 from memory import MemoryStore
 from router import IntentRouter, is_correction
 from state import Step, TaskState
+from trace import NullTracer, TraceLogHandler, Tracer
 from tts import Speaker
 from vision import GeminiVision, VisionError
 
@@ -72,7 +74,12 @@ def build_new_task(task_id: str, goal: str) -> TaskState:
     return TaskState(task_id=task_id, goal=goal)
 
 
-def build_observe_fn(stt_queue: "queue.Queue[str]", mac: MacController, task: TaskState) -> ObserveFn:
+def build_observe_fn(
+    stt_queue: "queue.Queue[str]",
+    mac: MacController,
+    task: TaskState,
+    tracer: Any = None,
+) -> ObserveFn:
     """Builds the OBSERVE callable: new voice transcript and/or fresh screenshot.
 
     Two ways a turn produces an observation:
@@ -95,11 +102,15 @@ def build_observe_fn(stt_queue: "queue.Queue[str]", mac: MacController, task: Ta
         A zero-arg callable suitable for `AgentLoop(observe_fn=...)`.
     """
 
+    trace = tracer or NullTracer()
+
     def _observe() -> Observation | None:
         try:
             instruction: str | None = stt_queue.get_nowait()
         except queue.Empty:
             instruction = None
+        if instruction is not None:
+            trace.event("HEARD", instruction)
         if instruction is None and task.next_actionable_step() is None:
             return None
         try:
@@ -112,7 +123,9 @@ def build_observe_fn(stt_queue: "queue.Queue[str]", mac: MacController, task: Ta
     return _observe
 
 
-def build_ground_fn(vision: GeminiVision, mac: MacController, router: IntentRouter) -> GroundFn:
+def build_ground_fn(
+    vision: GeminiVision, mac: MacController, router: IntentRouter, tracer: Any = None
+) -> GroundFn:
     """Builds the DECIDE->target callable: router fast-path, else Gemini box.
 
     Two-tier DECIDE: first the zero-LLM `IntentRouter` fast-paths (a step
@@ -135,9 +148,18 @@ def build_ground_fn(vision: GeminiVision, mac: MacController, router: IntentRout
         A callable suitable for `AgentLoop(ground_fn=...)`.
     """
 
+    trace = tracer or NullTracer()
+
     def _ground(task: TaskState, step: Step, observation: Observation) -> ActionPlan | None:
         routed = router.route(step.desc)
         if routed is not None:
+            trace.event("ROUTE", f"[{step.id}] fast-path {routed.kind}: {routed.target}")
+            if routed.kind == "type":
+                return ActionPlan(kind="type", step_id=step.id, text=routed.target)
+            if routed.kind == "hotkey":
+                return ActionPlan(kind="hotkey", step_id=step.id, target=routed.keys)
+            if routed.kind == "scroll":
+                return ActionPlan(kind="scroll", step_id=step.id, target=int(routed.target))
             return ActionPlan(kind=routed.kind, step_id=step.id, text=routed.target)
         if observation.screenshot is None:
             return None
@@ -148,23 +170,36 @@ def build_ground_fn(vision: GeminiVision, mac: MacController, router: IntentRout
             # the loop keeps living and retries next turn, instead of dying
             # with a traceback in the middle of the demo.
             logger.warning("grounding failed for step %s: %s", step.id, error)
+            trace.event("ERROR", f"[{step.id}] grounding failed: {error}")
             return None
+        confidence = f"{grounded.confidence:.2f}" if grounded.confidence is not None else "?"
+        trace.event(
+            "THINK",
+            f"[{step.id}] {step.desc} -> {grounded.kind} (conf {confidence}) :: "
+            f"{grounded.reasoning or ''}",
+        )
+        plan: ActionPlan | None = None
         if grounded.kind == "click" and grounded.box is not None:
             width, height = mac.screen_size_logical()
             target = denormalize_box(grounded.box, width, height)
-            return ActionPlan(kind="click", step_id=step.id, target=target, text=grounded.reasoning)
-        if grounded.kind == "type" and grounded.text:
-            return ActionPlan(kind="type", step_id=step.id, text=grounded.text)
-        if grounded.kind == "hotkey" and grounded.keys:
-            return ActionPlan(kind="hotkey", step_id=step.id, target=tuple(grounded.keys))
-        if grounded.kind == "scroll" and grounded.amount is not None:
-            return ActionPlan(kind="scroll", step_id=step.id, target=grounded.amount)
-        return None
+            plan = ActionPlan(kind="click", step_id=step.id, target=target, text=grounded.reasoning)
+        elif grounded.kind == "type" and grounded.text:
+            plan = ActionPlan(kind="type", step_id=step.id, text=grounded.text)
+        elif grounded.kind == "hotkey" and grounded.keys:
+            plan = ActionPlan(kind="hotkey", step_id=step.id, target=tuple(grounded.keys))
+        elif grounded.kind == "scroll" and grounded.amount is not None:
+            plan = ActionPlan(kind="scroll", step_id=step.id, target=grounded.amount)
+        if plan is not None:
+            detail = plan.target if plan.kind != "type" else plan.text
+            trace.event("ACTION", f"[{step.id}] {plan.kind}: {detail}")
+        else:
+            trace.event("LOOP", f"[{step.id}] model returned {grounded.kind} -> no actionable plan")
+        return plan
 
     return _ground
 
 
-def build_plan_fn(vision: GeminiVision) -> PlanFn:
+def build_plan_fn(vision: GeminiVision, tracer: Any = None) -> PlanFn:
     """Builds the planner callable: instruction -> ordered step descriptions.
 
     Args:
@@ -176,17 +211,23 @@ def build_plan_fn(vision: GeminiVision) -> PlanFn:
         simply repeat the instruction) instead of crashing the run.
     """
 
+    trace = tracer or NullTracer()
+
     def _plan(task: TaskState, instruction: str, screenshot: Any) -> list[str]:
+        trace.event("PLAN", f"decomposing: {instruction}")
         try:
-            return vision.plan_steps(task, instruction, screenshot)
+            steps = vision.plan_steps(task, instruction, screenshot)
         except VisionError as error:
             logger.warning("planning failed for instruction %r: %s", instruction, error)
+            trace.event("ERROR", f"planning failed: {error}")
             return []
+        trace.event("PLAN", f"steps: {steps}" if steps else "planner returned no steps")
+        return steps
 
     return _plan
 
 
-def build_verify_fn(vision: GeminiVision) -> VerifyFn:
+def build_verify_fn(vision: GeminiVision, tracer: Any = None) -> VerifyFn:
     """Builds the step-completion judge, degrading failures to "not done".
 
     Args:
@@ -197,12 +238,17 @@ def build_verify_fn(vision: GeminiVision) -> VerifyFn:
         Gemini call the step simply stays in progress -- the safe answer.
     """
 
+    trace = tracer or NullTracer()
+
     def _verify(task: TaskState, step: Step, screenshot: Any) -> bool:
         try:
-            return vision.verify_step_done(task, step, screenshot)
+            done = vision.verify_step_done(task, step, screenshot)
         except VisionError as error:
             logger.warning("verification failed for step %s: %s", step.id, error)
+            trace.event("ERROR", f"[{step.id}] verify failed: {error}")
             return False
+        trace.event("VERIFY", f"[{step.id}] {step.desc} -> {'DONE' if done else 'not yet'}")
+        return done
 
     return _verify
 
@@ -231,7 +277,7 @@ def build_act_fn(mac: MacController, settings: Settings) -> ActFn:
     return _act
 
 
-def build_override_fn(vision: GeminiVision) -> OverrideFn:
+def build_override_fn(vision: GeminiVision, tracer: Any = None) -> OverrideFn:
     """Builds the live correction detector: marker gate, then Gemini extraction.
 
     Two-tier, mirroring DECIDE: `router.is_correction` (zero-LLM markers like
@@ -248,16 +294,72 @@ def build_override_fn(vision: GeminiVision) -> OverrideFn:
         A callable suitable for `AgentLoop(override_fn=...)`.
     """
 
+    trace = tracer or NullTracer()
+
     def _override(task: TaskState, instruction: str) -> tuple[str, str] | None:
         if not is_correction(instruction):
             return None
+        trace.event("OVERRIDE", f"correction marker heard: {instruction}")
         try:
-            return vision.extract_override(task, instruction)
+            decision = vision.extract_override(task, instruction)
         except Exception:  # pragma: no cover - live network path
             logger.warning("override extraction failed; treating as plain instruction")
+            trace.event("ERROR", "override extraction failed; treated as plain instruction")
             return None
+        if decision is not None:
+            trace.event("OVERRIDE", f"when={decision[0]!r} rule={decision[1]!r}")
+        return decision
 
     return _override
+
+
+class _TracingHud:
+    """Tees every HUD update line into the trace stream (LOOP events)."""
+
+    def __init__(self, inner: Hud, tracer: Any) -> None:
+        self._inner = inner
+        self._tracer = tracer
+
+    def update(self, task_snapshot: dict[str, Any], log_line: str) -> None:
+        self._tracer.event("LOOP", log_line)
+        self._inner.update(task_snapshot, log_line)
+
+
+def launch_debug_console(settings: Settings) -> None:
+    """Opens a second Terminal window tailing the live trace stream.
+
+    Best-effort by design: on the first run macOS may ask to allow the
+    terminal to control Terminal.app (Automation permission); a refusal or
+    any osascript failure just means no debug window -- the trace file is
+    still written and can be tailed by hand:
+
+        .venv/bin/python scripts/trace_view.py continuum-trace.log
+    """
+    import shlex
+    import subprocess
+
+    here = Path(__file__).resolve().parent
+    python = here / ".venv" / "bin" / "python"
+    viewer = here / "scripts" / "trace_view.py"
+    trace_file = (here / settings.trace_path).resolve()
+    command = (
+        f"cd {shlex.quote(str(here))} && "
+        f"{shlex.quote(str(python))} {shlex.quote(str(viewer))} {shlex.quote(str(trace_file))}"
+    )
+    # `activate` brings the window to the FRONT: without it the new window
+    # opens behind whatever is focused and nobody ever sees it.
+    script = (
+        'tell application "Terminal"\n'
+        f'  do script "{command}"\n'
+        "  activate\n"
+        "end tell"
+    )
+    try:
+        subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=10.0, check=True
+        )
+    except Exception as error:  # noqa: BLE001 - a missing debug window is never fatal
+        logger.warning("could not open the debug console window: %s", error)
 
 
 def check_permissions_or_exit() -> None:
@@ -355,6 +457,13 @@ def main(argv: list[str] | None = None) -> int:
 
     check_permissions_or_exit()
 
+    tracer: Any = Tracer(settings.trace_path) if settings.debug_console else NullTracer()
+    if settings.debug_console:
+        # Vision's own log lines (escalations, retries, breaker) join the
+        # trace stream so the debug window tells the whole story.
+        logging.getLogger("vision").addHandler(TraceLogHandler(tracer))
+        launch_debug_console(settings)
+
     memory = MemoryStore(settings.db_path)
     mac = MacController(pyautogui_pause_s=settings.pyautogui_pause_s)
     vision = GeminiVision(settings)
@@ -372,11 +481,17 @@ def main(argv: list[str] | None = None) -> int:
             task.session_count,
             task.render()["progress"],
         )
+        tracer.event(
+            "BOOT",
+            f"resumed task {task.task_id} (session {task.session_count}, "
+            f"{task.render()['progress']} steps done): {task.goal}",
+        )
     else:
         task_id = uuid.uuid4().hex[:8]
         task = build_new_task(task_id, args.goal)
         memory.save_task_state(task)
         logger.info("Starting new task %s: %s", task.task_id, task.goal)
+        tracer.event("BOOT", f"new task {task.task_id} -- hold the PTT key and speak")
 
     stop_event = threading.Event()
     stt_queue: "queue.Queue[str]" = queue.Queue()
@@ -394,16 +509,16 @@ def main(argv: list[str] | None = None) -> int:
             loop = AgentLoop(
                 task=task,
                 memory=memory,
-                observe_fn=build_observe_fn(stt_queue, mac, task),
-                ground_fn=build_ground_fn(vision, mac, router),
+                observe_fn=build_observe_fn(stt_queue, mac, task, tracer),
+                ground_fn=build_ground_fn(vision, mac, router, tracer),
                 act_fn=build_act_fn(mac, settings),
                 speak_fn=speaker.say,
-                hud=hud,
+                hud=_TracingHud(hud, tracer),
                 stop_event=stop_event,
                 max_turns=settings.max_turns,
-                plan_fn=build_plan_fn(vision),
-                verify_fn=build_verify_fn(vision),
-                override_fn=build_override_fn(vision),
+                plan_fn=build_plan_fn(vision, tracer),
+                verify_fn=build_verify_fn(vision, tracer),
+                override_fn=build_override_fn(vision, tracer),
                 idle_sleep_s=settings.loop_idle_sleep_s,
                 max_idle_turns=settings.max_idle_turns,
                 max_step_attempts=settings.max_step_attempts,
@@ -415,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
             kill_switch.stop()
 
     logger.info("Run summary: %s", summary)
+    tracer.event("BOOT", f"run ended: {summary}")
+    tracer.close()
     memory.close()
     return 0
 

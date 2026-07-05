@@ -370,3 +370,26 @@ def test_keep_alive_off_exits_on_completion(tmp_path) -> None:
     assert spoken == [], "no keep-alive announcement in the default mode"
     assert len(task.steps) == 1, "the post-completion instruction was never consumed"
     memory.close()
+
+
+def test_act_records_step_history_capped(tmp_path) -> None:
+    """Each executed action lands in step.history (last 5 kept): grounding
+    uses it to avoid repeats, verification to judge invisible outcomes."""
+    memory = MemoryStore(str(tmp_path / "t.db"))
+    task = TaskState(task_id="HIST-1", goal="g", steps=[Step(id="s1", desc="copy the text")])
+
+    loop, _calls, _spoken = _make_loop(
+        task,
+        memory,
+        [Observation(screenshot="shot") for _ in range(8)],
+        max_turns=20,
+        max_step_attempts=99,  # keep acting on s1, never block
+    )
+    loop.run()
+
+    step = task.steps[0]
+    assert len(step.history) == 5, "history is capped at the 5 most recent actions"
+    assert all(h.startswith("click:") for h in step.history)
+    persisted = memory.load_task_state("HIST-1")
+    assert persisted.steps[0].history == step.history, "history survives persistence"
+    memory.close()

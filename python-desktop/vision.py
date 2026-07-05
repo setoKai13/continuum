@@ -29,8 +29,11 @@ logger = logging.getLogger(__name__)
 _BOX_RE = re.compile(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\]")
 
 # One cap for the planner, used in BOTH the prompt and the parser so the two
-# can never drift apart.
-_MAX_PLAN_STEPS = 6
+# can never drift apart. 10, not 6: a realistic flow (search the web, copy
+# text, paste it into another app) decomposes into ~10 atomic actions, and a
+# too-tight cap forces the planner into vague multi-action steps that the
+# executor cannot ground ("copy a recipe text").
+_MAX_PLAN_STEPS = 10
 
 
 class VisionError(Exception):
@@ -226,14 +229,18 @@ class GeminiVision:
         """
         self._remember(screenshot)
 
+        history = "; ".join(step.history[-5:]) or "none yet"
         prompt = (
             f"Goal: {task.goal}\n"
             f"Current step: {step.desc}\n"
             f"Notes so far: {step.note or 'none'}\n"
+            f"Actions ALREADY executed for this step: {history}\n"
             "You control a real macOS desktop. The LAST image is the CURRENT "
             "screen; any earlier images are recent history for context only. "
             "Decide the SINGLE next action to progress this step, targeting "
-            "the CURRENT screen, and reply with ONE JSON object, nothing else:\n"
+            "the CURRENT screen. Do NOT repeat an already-executed action "
+            "that visibly did not progress the step -- try a different one. "
+            "Reply with ONE JSON object, nothing else:\n"
             '  {"action":"click","box":[ymin,xmin,ymax,xmax]}   (box normalized 0-1000)\n'
             '  {"action":"type","text":"the text to type"}\n'
             '  {"action":"hotkey","keys":["command","v"]}\n'
@@ -338,11 +345,20 @@ class GeminiVision:
         prompt = (
             f"Goal: {task.goal}\n"
             f"Operator instruction: {instruction}\n"
-            "You control a real macOS desktop. Break this instruction into a "
-            f"short ordered list (max {_MAX_PLAN_STEPS}) of concrete, "
-            "single-action UI steps, e.g. 'open Slack', 'click the #general "
-            "channel', 'type the message'. Respond ONLY with a JSON array of "
-            "short strings."
+            "You control a real macOS desktop. Break this instruction into an "
+            f"ordered list (max {_MAX_PLAN_STEPS}) of ATOMIC UI steps. Each "
+            "step must be ONE action the executor can perform: click a "
+            "visible element, type text (spell out the exact text), press a "
+            "hotkey, scroll, or open an app/URL.\n"
+            "Rules:\n"
+            "- Include every keystroke a human would need: after clicking a "
+            "search field, add 'type <the query>' AND 'press Enter'.\n"
+            "- To capture text for later use, plan it as visible atomic "
+            "actions: 'select the ... text by triple-clicking it', then "
+            "'press cmd+c to copy'.\n"
+            "- Never write vague multi-action steps like 'copy a recipe' or "
+            "'search for X' -- decompose them.\n"
+            "Respond ONLY with a JSON array of short strings."
         )
         contents = [*visual_parts, prompt]
 
@@ -371,10 +387,18 @@ class GeminiVision:
         Raises:
             MissingApiKeyError: If no real API key is configured.
         """
+        history = "; ".join(step.history[-5:]) or "none"
         prompt = (
             f"Goal: {task.goal}\n"
             f"Step under check: {step.desc}\n"
-            "Looking ONLY at the current screenshot, is this step now complete? "
+            f"Actions the agent already executed for this step: {history}\n"
+            "Is this step now complete? Judge from the current screenshot. "
+            "If the step's outcome is NOT visible on a screenshot (e.g. "
+            "copying to the clipboard, a keyboard shortcut with no visual "
+            "effect), judge from the executed actions instead: answer YES "
+            "if they logically complete the step. A step is NOT complete "
+            "just because a field was clicked -- required text must be "
+            "visible, required pages must be loaded. "
             "Answer with a single word: YES or NO."
         )
         response = self._generate([screenshot, prompt])
