@@ -183,6 +183,9 @@ def build_ground_fn(
         if grounded.kind == "done":
             trace.event("VERIFY", f"[{step.id}] {step.desc} -> already satisfied")
             return ActionPlan(kind="done", step_id=step.id)
+        if grounded.kind == "replan":
+            trace.event("PLAN", f"[{step.id}] replan requested: {grounded.text or 'plan does not fit the screen'}")
+            return ActionPlan(kind="replan", step_id=step.id, text=grounded.text)
         plan: ActionPlan | None = None
         if grounded.kind == "click" and grounded.box is not None:
             width, height = mac.screen_size_logical()

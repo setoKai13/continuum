@@ -120,6 +120,11 @@ OverrideFn = Callable[[TaskState, str], tuple[str, str] | None]
 # verified done, the step is marked BLOCKED and the loop moves on.
 MAX_STEP_ATTEMPTS = 3
 
+# Cap on grounding-requested replans per run: replanning is how the agent
+# recovers from a plan the live screen invalidated, but an unbounded loop of
+# replans is its own failure mode.
+MAX_REPLANS = 3
+
 
 class AgentLoop:
     """Runs the OBSERVE->UPDATE_STATE->DECIDE->ACT loop for one task.
@@ -206,6 +211,7 @@ class AgentLoop:
         self._max_step_attempts = max_step_attempts
         self._keep_alive = keep_alive
         self._attempts: dict[str, int] = {}
+        self._replans = 0
 
     def run(self) -> RunSummary:
         """Executes the loop until done, paused (kill-switch), or budget spent.
@@ -344,6 +350,13 @@ class AgentLoop:
             self._log(turn, f"step {step.id} judged complete by grounding -> next")
             return "advanced"
 
+        # The grounding model judged the CURRENT step rests on a wrong
+        # assumption (e.g. a keyboard macro planned before the page
+        # existed): rebuild the remaining plan from the live screen,
+        # keeping completed steps in the history.
+        if plan.kind == "replan":
+            return self._replan(turn, observation, plan.text or "the plan no longer fits the screen")
+
         if self._plan_is_dangerous(plan):
             self._speak_fn("Refused: that action looks destructive.")
             self.memory.log_tool(self.task.task_id, turn, "refuse", {"plan_kind": plan.kind})
@@ -452,6 +465,41 @@ class AgentLoop:
                 self.task.add_fact(f"ignored unknown step_completed: {observation.step_completed}")
 
         return False
+
+    def _replan(self, turn: int, observation: Observation, reason: str) -> str:
+        """Rebuilds the pending plan tail from the current screen.
+
+        Args:
+            turn: Current loop iteration (for logs).
+            observation: This turn's observation (its screenshot anchors the
+                new decomposition to what is actually on screen).
+            reason: The grounding model's stated reason for the replan.
+
+        Returns:
+            "advanced" if the plan was rebuilt, "stalled" if replanning is
+            unavailable/exhausted (the normal attempt budget then applies).
+        """
+        if self._plan_fn is None or self._replans >= MAX_REPLANS:
+            self._log(turn, f"replan requested but unavailable/exhausted -> stall ({reason})")
+            return "stalled"
+        self._replans += 1
+        instruction = (
+            f"The current plan no longer fits the screen ({reason}). "
+            f"Re-plan the REMAINING steps to reach the goal from what is on screen now."
+        )
+        descriptions = self._plan_fn(self.task, instruction, observation.screenshot)
+        replaced = self.task.replace_pending_steps(descriptions)
+        if not replaced:
+            self._log(turn, "replan produced no steps -> stall")
+            return "stalled"
+        self._attempts.clear()
+        self.task.add_fact(f"replanned ({self._replans}/{MAX_REPLANS}): {reason}")
+        self.memory.log_tool(
+            self.task.task_id, turn, "replan", {"reason": reason, "steps": len(replaced)}
+        )
+        self.memory.save_task_state(self.task)
+        self._log(turn, f"replanned {len(replaced)} remaining step(s): {reason}")
+        return "advanced"
 
     def _apply_live_override(self, instruction: str, turn: int) -> bool:
         """Folds a mid-task correction into the hold-state. Returns True if applied.

@@ -262,6 +262,9 @@ class GeminiVision:
             "that did not progress the step -- try a different one. "
             "Reply with ONE JSON object, nothing else:\n"
             '  {"action":"done"}   (the step is already satisfied)\n'
+            '  {"action":"replan","reason":"..."}   (ONLY if this step rests on a '
+            "wrong assumption and cannot progress the goal on this screen -- "
+            "the remaining plan will be rebuilt from the current screen)\n"
             '  {"action":"click","box":[ymin,xmin,ymax,xmax]}   (box normalized 0-1000)\n'
             '  {"action":"type","text":"the text to type"}\n'
             '  {"action":"hotkey","keys":["command","v"]}\n'
@@ -374,9 +377,12 @@ class GeminiVision:
             "Rules:\n"
             "- Include every keystroke a human would need: after clicking a "
             "search field, add 'type <the query>' AND 'press Enter'.\n"
-            "- To capture text for later use, plan it as visible atomic "
-            "actions: 'select the ... text by triple-clicking it', then "
-            "'press cmd+c to copy'.\n"
+            "- To capture text from a WEB PAGE: first click a result link to "
+            "open the page, then 'press cmd+shift+r' (Safari Reader Mode, "
+            "clean article text) or click on the page body, THEN 'press "
+            "cmd+a' and 'press cmd+c'. NEVER select/copy right after using "
+            "the address bar: focus is still in the bar and cmd+a would "
+            "select the URL, not the content.\n"
             "- Never write vague multi-action steps like 'copy a recipe' or "
             "'search for X' -- decompose them.\n"
             "Respond ONLY with a JSON array of short strings."
@@ -656,6 +662,11 @@ def _grounded_from_action(action: dict[str, Any], reasoning: str) -> GroundedAct
             return None
         return GroundedAction(
             kind="scroll", amount=amount, reasoning=reasoning.strip(), confidence=confidence
+        )
+    if kind == "replan":
+        reason = str(action.get("reason") or "").strip()
+        return GroundedAction(
+            kind="replan", text=reason or None, reasoning=reasoning.strip(), confidence=confidence
         )
     if kind in ("noop", "done"):
         return GroundedAction(kind=kind, reasoning=reasoning.strip(), confidence=confidence)

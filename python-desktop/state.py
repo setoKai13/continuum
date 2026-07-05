@@ -157,6 +157,27 @@ class TaskState(BaseModel):
             created.append(step)
         return created
 
+    def replace_pending_steps(self, descriptions: list[str]) -> list[Step]:
+        """Swaps every non-done step for a freshly planned tail.
+
+        This is the replanning primitive: when the live screen invalidates
+        the remaining plan (grounding answered "replan"), completed steps
+        stay in the history untouched and everything still pending is
+        replaced by the new decomposition.
+
+        Args:
+            descriptions: Ordered step descriptions for the new plan tail.
+
+        Returns:
+            The newly created steps (empty if `descriptions` was all blank,
+            in which case the pending steps are left in place).
+        """
+        cleaned = [d for d in descriptions if d.strip()]
+        if not cleaned:
+            return []
+        self.steps = [s for s in self.steps if s.status == StepStatus.DONE]
+        return self.add_steps(cleaned)
+
     def apply_override(self, when: str, rule: str) -> list[Step]:
         """Records an operator correction and recalibrates matching steps.
 

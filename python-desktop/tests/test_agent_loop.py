@@ -435,3 +435,59 @@ def test_completes_step_plan_marks_step_done_after_acting(tmp_path) -> None:
     assert len(calls) == 1, "typed exactly once, then the step was done"
     assert task.steps[0].history == ["type: hi"]
     memory.close()
+
+
+def test_replan_replaces_pending_steps_and_continues(tmp_path) -> None:
+    """Grounding answers "replan" -> the pending tail is rebuilt from the
+    live screen (done steps kept) and the loop acts on the new plan."""
+    memory = MemoryStore(str(tmp_path / "t.db"))
+    task = TaskState(
+        task_id="RPL-1",
+        goal="capture the recipe",
+        steps=[Step(id="s1", desc="open Safari", status=StepStatus.DONE),
+               Step(id="s2", desc="press cmd+a in the address bar")],
+    )
+
+    def ground_fn(t: TaskState, step: Any, obs: Observation) -> ActionPlan:
+        if step.desc == "press cmd+a in the address bar":
+            return ActionPlan(kind="replan", step_id=step.id, text="focus is in the address bar")
+        return ActionPlan(kind="click", step_id=step.id, target=(5, 5), completes_step=True)
+
+    loop, calls, _spoken = _make_loop(
+        task,
+        memory,
+        [Observation(screenshot="shot") for _ in range(6)],
+        max_turns=10,
+        ground_fn=ground_fn,
+        plan_fn=lambda t, instruction, shot: ["click the page body", "press cmd+a"],
+    )
+    summary = loop.run()
+
+    assert summary.status == TaskStatus.DONE.value
+    descs = [s.desc for s in task.steps]
+    assert descs[0] == "open Safari", "done steps survive the replan"
+    assert "press cmd+a in the address bar" not in descs, "the bad step was replaced"
+    assert len(calls) == 2, "the two replacement steps were executed"
+    assert any("replanned" in f for f in task.facts)
+    memory.close()
+
+
+def test_replan_budget_exhausted_degrades_to_stall(tmp_path) -> None:
+    memory = MemoryStore(str(tmp_path / "t.db"))
+    task = TaskState(task_id="RPL-2", goal="g", steps=[Step(id="s1", desc="doomed step")])
+
+    loop, calls, _spoken = _make_loop(
+        task,
+        memory,
+        [Observation(screenshot="shot") for _ in range(12)],
+        max_turns=20,
+        ground_fn=lambda t, step, obs: ActionPlan(kind="replan", step_id=step.id, text="never fits"),
+        plan_fn=lambda t, instruction, shot: ["doomed step"],  # replan reproduces the same step
+    )
+    summary = loop.run()
+
+    assert calls == [], "nothing ever actually executed"
+    assert summary.status == TaskStatus.ACTIVE.value
+    replans = [f for f in task.facts if f.startswith("replanned")]
+    assert len(replans) == 3, "replanning is capped, then the attempt budget takes over"
+    memory.close()
